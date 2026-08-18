@@ -12,3 +12,13 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    # The image declares VOLUME /var/lib/postgresql/data, so without an explicit
+    # mapping every `up` mints a fresh ANONYMOUS volume that a plain `down`
+    # (no -v) then orphans — ~118MB leaked per E2E cycle, invisible until the
+    # disk fills. Naming it caps the cost at one reusable volume and lets
+    # `down -v` actually reclaim it. Same reasoning as docker-compose.ci.yml.
+    volumes:
+      - gbrain-test-pg-data:/var/lib/postgresql/data
+
+volumes:
+  gbrain-test-pg-data:
