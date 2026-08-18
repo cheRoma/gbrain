@@ -110,6 +110,7 @@ bun run test:e2e                  # real-Postgres E2E (requires DATABASE_URL)
 # E2E setup (Postgres with pgvector)
 docker compose -f docker-compose.test.yml up -d
 DATABASE_URL=postgresql://postgres:postgres@localhost:5434/gbrain_test bun run test:e2e
+docker compose -f docker-compose.test.yml down -v   # -v matters: drops the pg volume
 
 # Or use your own Postgres / Supabase
 DATABASE_URL=postgresql://... bun run test:e2e
