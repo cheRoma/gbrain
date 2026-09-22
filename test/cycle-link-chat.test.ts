@@ -281,3 +281,16 @@ describe('runPhaseLinkChat — ignored directories', () => {
     expect(r.details.linked).toBe(1); // `tmp` is no longer on the list
   });
 });
+
+// Regression pin: since the v0.46.20.0 cycle split (#4263) the per-source
+// autopilot cycle runs ONLY SOURCE_FRESHNESS_PHASES; any other source phase
+// has no automatic lane. link_chat fell out of that list on the 0.46.2x merge
+// and silently stopped running for a month (2026-08-19 → 2026-09-22) while
+// every phase-level test stayed green. Pin the autopilot wiring, not just
+// the phase.
+describe('link_chat autopilot wiring', () => {
+  test('link_chat is in SOURCE_FRESHNESS_PHASES so the per-source autopilot cycle runs it', async () => {
+    const { SOURCE_FRESHNESS_PHASES } = await import('../src/core/cycle.ts');
+    expect(SOURCE_FRESHNESS_PHASES).toContain('link_chat');
+  });
+});

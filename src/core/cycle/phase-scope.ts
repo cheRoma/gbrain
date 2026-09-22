@@ -47,4 +47,10 @@ export const PHASE_SCOPE: Record<CyclePhase, PhaseScope> = {
 export const SOURCE_FRESHNESS_PHASES: CyclePhase[] = [
   'lint', 'backlinks', 'sync', 'extract', 'extract_facts',
   'recompute_emotional_weight',
+  // FORK DELTA (link_chat branch): link_chat is deterministic, zero-model and
+  // capped per tick (max_pages_per_tick), so it meets the freshness bar. Since
+  // the v0.46.20.0 cycle split (#4263) non-freshness source phases have no
+  // automatic lane, and link_chat silently stopped running on 2026-08-19 —
+  // chat captures piled up as orphans for a month. Keep it in this list.
+  'link_chat',
 ];
