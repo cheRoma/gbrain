@@ -20,7 +20,11 @@ const arm = 'ubicloud-standard-4-arm-ubuntu-2404';
 const targetRunners = (job: Job) =>
   JSON.parse(/fromJSON\('([^']+)'\)\[matrix\.target\]/.exec(job['runs-on']!)![1]!) as Record<string, string>;
 
-describe('CI runner routing', () => {
+// FORK DELTA: this fork has no Ubicloud runners, so its workflows run on
+// GitHub-hosted labels and the Ubicloud routing pins below do not apply.
+const usesUbicloud = readFileSync(join(root, '.github/workflows/test.yml'), 'utf8').includes('ubicloud-');
+
+describe.skipIf(!usesUbicloud)('CI runner routing', () => {
   test('owned Linux validation jobs use Ubicloud without moving release publishing', () => {
     for (const file of ['test.yml', 'e2e.yml', 'heavy-tests.yml', 'persistence-validation.yml', 'native-locks.yml', 'actionlint.yml', 'semgrep.yml']) {
       for (const job of Object.values(load(file).jobs)) {

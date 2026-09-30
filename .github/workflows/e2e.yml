@@ -124,6 +124,9 @@ jobs:
         shell: bash
         env:
           FULL_CORPUS: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.full_corpus) }}
+          # LOCAL DELTA: inputs for the base-branch resolution below.
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           if [ "$FULL_CORPUS" = "true" ]; then
             # Full-profile coverage carries the complete E2E corpus separately.
@@ -136,8 +139,8 @@ jobs:
             # branch and fetch it INTO refs/remotes/origin/master so
             # select-e2e.ts keeps diffing origin/master...HEAD unchanged.
             # On upstream default_branch IS master: byte-equivalent.
-            BASE_BRANCH="${{ github.event.repository.default_branch }}"
-            if [ "${{ github.ref_name }}" = "$BASE_BRANCH" ]; then
+            BASE_BRANCH="${BASE_BRANCH:-master}"
+            if [ "${REF_NAME:-}" = "$BASE_BRANCH" ]; then
               echo "dispatch on the default branch ($BASE_BRANCH) — no base to diff against; nothing to select" >&2
               : > "$RUNNER_TEMP/selected.txt"
             else
