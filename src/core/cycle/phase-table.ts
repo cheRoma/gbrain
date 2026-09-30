@@ -38,7 +38,7 @@ export const MANAGED_PHASE_TABLE: Readonly<Record<CyclePhase, ManagedPhaseEntry>
   drift: { class: 'writes', reason: 'The drift report page publishes through the maintenance coordinator.' },
   conversation_facts_backfill: { class: 'writes', reason: 'Backfilled conversation facts publish through coordinated writes.' },
   enrich_thin: { class: 'writes', reason: 'Enriched pages publish through the maintenance coordinator.' },
-  link_chat: { class: 'managed_skip', reason: 'Fork phase: hub pages and hub-to-chat links are written through legacy engine methods, so it is skipped on managed brains.' },
+  link_chat: { class: 'writes', reason: 'Fork phase: auto-created hub pages publish through the maintenance coordinator; hub-to-chat edges commit in a coordinated database-only transaction.' },
   skillopt: { class: 'no_coordinated_write', reason: 'Writes skill files and proposals outside the brain database.' },
   embed: { class: 'no_coordinated_write', reason: 'Embeddings are a physical projection the canonical writer guard does not cover.' },
   orphans: { class: 'no_coordinated_write', reason: 'Read-only orphan report.' },

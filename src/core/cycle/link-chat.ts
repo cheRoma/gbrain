@@ -25,6 +25,11 @@
  * `PHASE_SCOPE='source'`), minus the LLM/budget machinery — linking is
  * deterministic, so the only throttle is `max_pages_per_tick`.
  *
+ * On a managed brain (persistence activated) both writes go through the
+ * persistence coordinator: the hub stub publishes as a maintenance page and the
+ * hub-to-chat edge commits in a coordinated database-only transaction, like
+ * manual and derived links. An unmanaged brain keeps the direct engine calls.
+ *
  * Default OFF; enable with `gbrain config set cycle.link_chat.enabled true`.
  *
  * Config keys (defaults explicit):
@@ -38,6 +43,9 @@
 import type { BrainEngine } from '../engine.ts';
 import { listSources } from '../sources-ops.ts';
 import { findOrphans } from '../../commands/orphans.ts';
+import { serializeMarkdown } from '../markdown.ts';
+import { withCoordinatedWrite } from '../persistence/context.ts';
+import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
 
 export interface LinkChatPhaseOpts {
   dryRun?: boolean;
@@ -176,21 +184,67 @@ async function ensureHub(
   hubSlug: string,
   project: string,
   sourceId: string,
+  maintenance: MaintenanceAuthority | null,
 ): Promise<boolean> {
   const existing = await engine.getPage(hubSlug, { sourceId });
   if (existing) return false;
+  const title = `${project} — project hub`;
+  const body = `Auto-created hub for project \`${project}\`. Collects captured Claude Code sessions for this project.`;
+  const frontmatter = { auto_created_by: 'link_chat' };
+  if (maintenance) {
+    await publishMaintenancePage(
+      engine,
+      maintenance,
+      hubSlug,
+      serializeMarkdown(frontmatter, body, '', { type: 'project', title, tags: [] }),
+      { expectedRevision: null },
+    );
+    return true;
+  }
   await engine.putPage(
     hubSlug,
-    {
-      type: 'project',
-      title: `${project} — project hub`,
-      compiled_truth: `Auto-created hub for project \`${project}\`. Collects captured Claude Code sessions for this project.`,
-      timeline: '',
-      frontmatter: { auto_created_by: 'link_chat' },
-    },
+    { type: 'project', title, compiled_truth: body, timeline: '', frontmatter },
     { sourceId },
   );
   return true;
+}
+
+/**
+ * hub → chat edge. On a managed brain the canonical writer guard covers
+ * `links`, so the edge commits inside a coordinated transaction that holds
+ * both endpoint page keys and serializes with publications of either page.
+ */
+async function linkHubToChat(
+  engine: BrainEngine,
+  hubSlug: string,
+  chatSlug: string,
+  sourceId: string,
+  maintenance: MaintenanceAuthority | null,
+): Promise<void> {
+  const write = (e: BrainEngine) =>
+    e.addLink( // gbrain-allow-direct-insert: link_chat IS a cycle phase — the hub→chat edge is its reconcile output
+      hubSlug,
+      chatSlug,
+      'session capture',
+      'session',
+      'link-chat',
+      undefined,
+      undefined,
+      { fromSourceId: sourceId, toSourceId: sourceId },
+    );
+  if (!maintenance) {
+    await write(engine);
+    return;
+  }
+  await engine.transaction((tx) =>
+    withCoordinatedWrite(tx, [sourceId], async () => {
+      await tx.lockPageKeys([
+        { sourceId, slug: hubSlug },
+        { sourceId, slug: chatSlug },
+      ]);
+      await write(tx);
+    }),
+  );
 }
 
 export async function runPhaseLinkChat(
@@ -238,6 +292,9 @@ export async function runPhaseLinkChat(
     let srcSkipped = 0;
     let srcIgnored = 0;
     let srcWould = 0;
+    // Resolved on the first page that needs a write, so a source with nothing
+    // to link never registers a writer. null = unmanaged brain (legacy path).
+    let maintenance: MaintenanceAuthority | null | undefined;
 
     for (const o of chatOrphans) {
       if (processed >= cfg.maxPagesPerTick) break;
@@ -260,13 +317,14 @@ export async function runPhaseLinkChat(
         continue;
       }
 
+      if (maintenance === undefined) maintenance = await maintenancePreflight(engine, src.id);
       const existingHub = await findExistingHub(engine, project, src.id);
       const hubSlug = existingHub ?? `projects/${project}/_index`;
       if (existingHub) {
         hubsReused++;
         srcReused++;
       } else {
-        const created = await ensureHub(engine, hubSlug, project, src.id);
+        const created = await ensureHub(engine, hubSlug, project, src.id, maintenance);
         if (created) {
           hubsCreated++;
           srcHubs++;
@@ -274,16 +332,7 @@ export async function runPhaseLinkChat(
       }
       // hub → chat: the chat page gains an inbound link and stops being an
       // orphan. ON CONFLICT DO NOTHING makes re-runs cheap and idempotent.
-      await engine.addLink( // gbrain-allow-direct-insert: link_chat IS a cycle phase — the hub→chat edge is its reconcile output
-        hubSlug,
-        o.slug,
-        'session capture',
-        'session',
-        'link-chat',
-        undefined,
-        undefined,
-        { fromSourceId: src.id, toSourceId: src.id },
-      );
+      await linkHubToChat(engine, hubSlug, o.slug, src.id, maintenance);
       linked++;
       srcLinked++;
     }

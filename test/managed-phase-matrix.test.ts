@@ -297,7 +297,18 @@ const MATRIX: Record<CyclePhase, Entry> = {
       expect((await engine.getPage('people/alice-example', { sourceId }))?.compiled_truth).toContain('Alice founded WidgetCo.');
     },
   },
-  link_chat: { config: { 'cycle.link_chat.enabled': 'true' } },
+  link_chat: {
+    config: { 'cycle.link_chat.enabled': 'true' },
+    seed: async ({ engine, sourceId }) => put(engine, sourceId, 'chat/2026-09-20-example-project-abcdef12', page('chat', 'Session', 'A captured session.')),
+    assert: async ({ engine, sourceId, result }) => {
+      expect(result.details).toMatchObject({ linked: 1, hubs_created: 1 });
+      expect((await committed(engine, sourceId, 'projects/example-project/_index')).at(-1)?.intent?.kind).toBe('managed_maintenance_page');
+      expect((await engine.getPage('projects/example-project/_index', { sourceId }))?.frontmatter?.auto_created_by).toBe('link_chat');
+      expect(await engine.executeRaw(`SELECT l.link_source FROM links l JOIN pages f ON f.id=l.from_page_id JOIN pages t ON t.id=l.to_page_id
+        WHERE f.source_id=$1 AND f.slug='projects/example-project/_index' AND t.slug='chat/2026-09-20-example-project-abcdef12'`, [sourceId]))
+        .toEqual([{ link_source: 'link-chat' }]);
+    },
+  },
   skillopt: {
     config: { 'cycle.skillopt.enabled': 'true', 'cycle.skillopt.per_skill_cap_usd': '10', 'cycle.skillopt.brain_wide_cap_usd': '10' },
     env: { GBRAIN_SKILLS_DIR: '{root}/../skills' },

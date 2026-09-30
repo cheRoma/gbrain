@@ -51,7 +51,7 @@ import { createProgress, type ProgressReporter } from './progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from './cli-options.ts';
 import { tryAcquireDbLock, reapDeadHolderLocks, LockStolenError, type DbLockHandle } from './db-lock.ts';
 import { timeContainedPhase } from './cycle/phase-containment.ts';
-import { isManagedBrain, MANAGED_PHASE_TABLE } from './cycle/phase-table.ts';
+import { isManagedBrain } from './cycle/phase-table.ts';
 import { assertValidSourceId } from './source-id.ts';
 import { PHASE_SCOPE, SOURCE_FRESHNESS_PHASES, type PhaseScope } from './cycle/phase-scope.ts';
 import { assertEmbedNotStalled } from './embed-stall.ts';
@@ -2835,11 +2835,6 @@ export async function runCycle(
           summary: 'no database connected',
           details: { reason: 'no_database' },
         });
-      } else if (await isManagedBrain(engine)) {
-        // link_chat writes through legacy engine methods, which the
-        // canonical writer guard refuses once persistence is managed.
-        const reason = MANAGED_PHASE_TABLE.link_chat.reason;
-        phaseResults.push({ phase: 'link_chat', status: 'skipped', duration_ms: 0, summary: reason, details: { reason: 'managed_skip' } });
       } else {
         progress.start('cycle.link_chat');
         const { runPhaseLinkChat } = await import('./cycle/link-chat.ts');
