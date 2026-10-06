@@ -45,6 +45,7 @@ import { listSources } from '../sources-ops.ts';
 import { findOrphans } from '../../commands/orphans.ts';
 import { serializeMarkdown } from '../markdown.ts';
 import { withCoordinatedWrite } from '../persistence/context.ts';
+import { maintenanceAttribution } from '../persistence/attribution.ts';
 import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
 
 export interface LinkChatPhaseOpts {
@@ -236,6 +237,7 @@ async function linkHubToChat(
     await write(engine);
     return;
   }
+  const attribution = await maintenanceAttribution(engine);
   await engine.transaction((tx) =>
     withCoordinatedWrite(tx, [sourceId], async () => {
       await tx.lockPageKeys([
@@ -243,7 +245,7 @@ async function linkHubToChat(
         { sourceId, slug: chatSlug },
       ]);
       await write(tx);
-    }),
+    }, attribution),
   );
 }
 
