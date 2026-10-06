@@ -34,9 +34,10 @@ import { lookupRefsForSlugs } from './link-reconciliation.ts';
  *      sidecar (O_EXCL) fences concurrent sweeps off the same file so
  *      two processes never double-pay one transcript's LLM call.
  *
- * Budget: a wall-clock budget aborts BETWEEN items (and threads an
- * AbortSignal into the fence pass + corpus extraction); the report
- * carries the partial counts. runMaintenanceSweep NEVER throws.
+ * Budget: a wall-clock budget stops the sweep BETWEEN items (and threads an
+ * AbortSignal into the zero-LLM fence pass only; a corpus extraction in
+ * flight finishes and writes its sidecar, E-N2); the report carries the
+ * partial counts. runMaintenanceSweep NEVER throws.
  *
  * Heavy dependencies (cycle extractor, extract command cores, facts
  * pipeline, gateway) are lazy-imported inside each pass — the
@@ -48,7 +49,8 @@ import { join } from 'node:path';
 import { readdir, readFile, writeFile, rm, stat } from 'node:fs/promises';
 import type { BrainEngine, LinkBatchInput, TimelineBatchInput } from './engine.ts';
 import type { FactsBackstopCtx } from './facts/backstop.ts';
-import { detectCapabilities, type CapabilityReport } from './capability.ts';
+import type { CapabilityReport } from './capability.ts';
+import { maintenanceTransaction } from './persistence/attribution.ts';
 
 /** Delay before the serve-startup sweep fires (post-connect settle). */
 export const STARTUP_SWEEP_DELAY_MS = 3_000;
@@ -79,6 +81,14 @@ export const CORPUS_CLAIM_SUFFIX = '.in-progress';
 /** Claims older than this belong to dead sweeps and are reclaimable. */
 export const CORPUS_CLAIM_STALE_MS = 60 * 60 * 1000;
 
+/** #5887 skip reason per unfinished window run (the file waits for a later sweep). */
+const CORPUS_WINDOW_SKIP = {
+  aborted: 'budget_exhausted:corpus',
+  contended: 'corpus_in_progress',
+  partial: 'corpus_windows_pending',
+  changed: 'corpus_changed',
+} as const;
+
 export interface SweepOpts {
   /** Source to sweep. Default 'default' (the serve's registered source). */
   sourceId?: string;
@@ -92,7 +102,8 @@ export interface SweepOpts {
   log?: (msg: string) => void;
   /**
    * Capability report override (test seam / caller already computed one).
-   * Default: detectCapabilities() — config-plane, no network.
+   * Default: the engine-resolved extraction model checked against the
+   * configured gateway (facts/extraction-availability.ts) — no network.
    */
   capabilities?: CapabilityReport;
 }
@@ -109,6 +120,8 @@ export interface SweepReport {
   /** Stale sweep-owned edges reconciled away (#4196). */
   linksRemoved: number;
   timelineExtracted: number;
+  /** #5887: per corpus file windowed this sweep — windows extracted now and still remaining. */
+  corpus_files: Array<{ file: string; windows_done: number; windows_remaining: number }>;
   skipped: SweepSkip[];
   durationMs: number;
 }
@@ -135,6 +148,7 @@ export async function runMaintenanceSweep(
     linksExtracted: 0,
     linksRemoved: 0,
     timelineExtracted: 0,
+    corpus_files: [],
     skipped: [],
     durationMs: 0,
   };
@@ -147,9 +161,8 @@ export async function runMaintenanceSweep(
   };
   const overBudget = () => Date.now() >= deadline;
 
-  // Budget abort signal: threads into the fence pass's per-page loop and
-  // the corpus extraction's network call so a long item can be interrupted
-  // at its own checkpoints. unref'd — the sweep must never hold the
+  // Budget abort signal: threads into the fence pass's per-page loop so a
+  // long item can be interrupted at its own checkpoints. unref'd — the sweep must never hold the
   // process open (the serve unref convention).
   const budgetController = new AbortController();
   const budgetTimer = setTimeout(
@@ -227,11 +240,16 @@ export async function runMaintenanceSweep(
       if (overBudget()) {
         skip('budget_exhausted:corpus');
       } else {
+        // E-N2: the budget stops the corpus pass BETWEEN files and windows
+        // (overBudget), never mid-call. An extraction slower than the budget
+        // aborted at the deadline wrote no sidecar, so every scheduled
+        // `sweep --once` paid for the same call and finished nothing. The
+        // gateway's own timeout still bounds a hung call.
         await runCorpusIngestPass(engine, {
           sourceId,
           batchLimit,
           overBudget,
-          signal: budgetController.signal,
+          signal: new AbortController().signal,
           capabilities: opts.capabilities,
           report,
           skip,
@@ -299,7 +317,7 @@ async function runLinksTimelinePass(
 
   // #4196: honor the watermark this pass stamps, or repeated bounded sweeps
   // re-select the same newest batchLimit rows forever and page batchLimit+1
-  // is never reached. Same predicate as the engines' buildStalePagesWhere
+  // is never reached. Same predicate as engine-sql/pages.ts stalePagesWhere
   // (no versionTs branch — extractor-version catch-up is `extract --stale`'s
   // job; the sweep is a recency back-stop). The µs to_char projection is the
   // #1768 stamp discipline: stamp the row's READ updated_at, not now(), so an
@@ -458,7 +476,7 @@ async function runLinksTimelinePass(
   // Engine batch primitives self-retry; default auditSite labels apply
   // (BATCH_AUDIT_SITES is a closed enum owned by retry.ts).
   if (tlBatch.length > 0) {
-    report.timelineExtracted += await engine.addTimelineEntriesBatch(tlBatch); // gbrain-allow-direct-insert: same extract-path rationale as addLinksBatch above [CX-P0.3]
+    report.timelineExtracted += await maintenanceTransaction(engine, tx => tx.addTimelineEntriesBatch(tlBatch)); // gbrain-allow-direct-insert: same extract-path rationale as addLinksBatch above [CX-P0.3]
   }
 
   // #4196: reconcile removals. The sweep is the ONLY link extraction remote
@@ -514,11 +532,14 @@ async function runLinksTimelinePass(
 }
 
 /**
- * Pass 3 body. One `runFactsPipeline` call per unprocessed corpus file —
- * the narrowest existing entry that takes raw transcript text through
- * extract → resolve → dedup → insert. Visibility left unset so the
+ * Pass 3 body. `runFactsPipeline` — the narrowest existing entry that takes
+ * raw transcript text through extract → resolve → dedup → insert — runs once
+ * per writeback turn file and once per turn-boundary window of every other
+ * corpus file (#5887, context/corpus-windows.ts: per-file and per-sweep
+ * window caps, `.progress` resume). Visibility left unset so the
  * pipeline resolves the operator default via resolveDefaultVisibility
- * (backstop.ts:359, [ENG-8]). Sidecar written AFTER success only.
+ * (backstop.ts:359, [ENG-8]). `.ingested` written only after the file's last
+ * window succeeds.
  *
  * Concurrency: a `<file>.in-progress` claim sidecar (O_EXCL create) fences
  * each file before its LLM call — a manual `gbrain sweep --once` racing the
@@ -558,12 +579,10 @@ async function runCorpusIngestPass(
   const txtFiles = entries.filter(n => n.endsWith('.txt')).sort();
   if (txtFiles.length === 0) return;
 
-  const alreadyIngested = txtFiles.filter(n => entrySet.has(n + CORPUS_INGESTED_SUFFIX));
-  skip('already_ingested', alreadyIngested.length);
-
-  const candidates = txtFiles
-    .filter(n => !entrySet.has(n + CORPUS_INGESTED_SUFFIX))
-    .slice(0, batchLimit);
+  // #5887: finished files re-enter when changed since their `.progress`.
+  const windows = await import('./context/corpus-windows.ts');
+  const { candidates, alreadyIngested } = await windows.selectCorpusCandidates(dir, txtFiles, entrySet, batchLimit, overBudget);
+  skip('already_ingested', alreadyIngested);
   if (candidates.length === 0) return;
 
   // Ambient-writeback turn files (`.wb-` basenames) ride this pass as the
@@ -575,7 +594,7 @@ async function runCorpusIngestPass(
   // OFF retires banked turns even when the brain cannot extract — otherwise
   // the files linger eligible and a later re-enable would extract turns the
   // operator already revoked (codex re-review, this wave).
-  const { parseWbFileName, writebackOffSidecarJson, corpusFileSessionId } = await import('./context/corpus-segments.ts');
+  const { parseWbFileName, writebackOffSidecarJson, selfCaptureSidecarJson, corpusFileSessionId, corpusTextForExtraction } = await import('./context/corpus-segments.ts');
   const { resolveWritebackConfig } = await import('./facts/writeback-config.ts');
   const { loadConfig: loadFileCfg } = await import('./config.ts');
   const { isValidSourceId } = await import('./source-id.ts');
@@ -605,8 +624,8 @@ async function runCorpusIngestPass(
 
   // [CX-P0.5] Keyless rule: no extraction provider configured ⇒ skip the
   // whole pass. Agent-authored fences (pass 1) carry keyless memory.
-  const caps = ctx.capabilities ?? detectCapabilities();
-  if (!caps.extraction.available) {
+  const { extractionAvailableForEngine } = await import('./facts/extraction-availability.ts');
+  if (!(await extractionAvailableForEngine(engine, ctx.capabilities))) {
     const retired = await retireWbCandidatesIfOff();
     skip('keyless', candidates.length - retired.size);
     return;
@@ -623,12 +642,17 @@ async function runCorpusIngestPass(
 
   const { runFactsPipeline } = await import('./facts/backstop.ts');
   const { isDreamOutput } = await import('./cycle/transcript-discovery.ts');
-  const { claudeCliSelfSessionIds } = await import('./ai/providers/claude-cli-scratch.ts');
-  const selfCaptureIds = claudeCliSelfSessionIds();
+  const { claudeCliSelfProjectDirs, isClaudeCliSelfSessionId } = await import('./ai/providers/claude-cli-scratch.ts');
+  const selfProjectDirs = claudeCliSelfProjectDirs();
 
+  let windowsLeft = windows.resolveCorpusWindowsPerSweepTotal(process.env, log);
   for (let i = 0; i < candidates.length; i++) {
     if (overBudget()) {
       skip('budget_exhausted:corpus', candidates.length - i);
+      break;
+    }
+    if (windowsLeft <= 0) {
+      skip('corpus_window_cap', candidates.length - i);
       break;
     }
     const name = candidates[i];
@@ -646,7 +670,10 @@ async function runCorpusIngestPass(
       // Re-check under the claim: another sweep may have finished this file
       // between our readdir and our claim (it releases its claim only after
       // writing the .ingested sidecar, so this closes the double-spend gap).
-      const doneAlready = await stat(full + CORPUS_INGESTED_SUFFIX).then(() => true, () => false);
+      const doneAlready = await stat(full + CORPUS_INGESTED_SUFFIX).then(
+        () => windows.finishedCorpusFileState(full, name).then(s => s === 'done' || s === 'legacy', () => false),
+        () => false,
+      );
       if (doneAlready) {
         skip('already_ingested');
         continue;
@@ -655,11 +682,8 @@ async function runCorpusIngestPass(
       // #5413: a corpus file captured from gbrain's own claude-cli call, in
       // any capture form. Extracting it spawns another claude-cli call; the
       // classification is permanent, so the terminal sidecar stops the retry.
-      if (selfCaptureIds.has(corpusFileSessionId(name))) {
-        await writeFile(
-          full + CORPUS_INGESTED_SUFFIX,
-          JSON.stringify({ ingested_at: new Date().toISOString(), skipped: 'self_capture' }) + '\n',
-        );
+      if (isClaudeCliSelfSessionId(corpusFileSessionId(name), selfProjectDirs)) {
+        await writeFile(full + CORPUS_INGESTED_SUFFIX, selfCaptureSidecarJson());
         skip('self_capture');
         continue;
       }
@@ -682,6 +706,7 @@ async function runCorpusIngestPass(
         continue;
       }
 
+      const fileStat = windows.corpusFileStat(await stat(full));
       const raw = await readFile(full, 'utf-8');
 
       // Anti-loop: never ingest dream-generated outputs. Marking them
@@ -704,7 +729,7 @@ async function runCorpusIngestPass(
       const wbSourceId = wbMeta?.sourceId && isValidSourceId(wbMeta.sourceId)
         ? wbMeta.sourceId
         : sourceId;
-      const r = await runFactsPipeline(raw, {
+      const pipelineCtx: FactsBackstopCtx = {
         engine,
         sourceId: wbMeta ? wbSourceId : sourceId,
         sessionId: wbMeta ? wbMeta.sessionId : `sweep:corpus:${name}`,
@@ -717,9 +742,33 @@ async function runCorpusIngestPass(
         mode: 'inline',
         remote: false,
         abortSignal: signal,
+        // #5888: the file's write time anchors the capture dedup window, not the (possibly late) sweep.
+        turnAt: await stat(full).then(st => st.mtime, () => undefined),
         ...(wbMeta && wbCfg.mode === 'salient' ? { notabilityFilter: 'medium-and-up' as const } : {}),
         // visibility deliberately unset → resolveDefaultVisibility [ENG-8]
-      });
+      };
+      // #5812: pasted blocks never reach the extractor (file unchanged). A wb
+      // file is one gated turn: one call. Every other corpus file is windowed
+      // at turn boundaries (#5887) and may finish over several sweeps.
+      let r: Awaited<ReturnType<typeof runFactsPipeline>>;
+      if (wbMeta) {
+        windowsLeft -= 1;
+        r = await runFactsPipeline(corpusTextForExtraction(name, raw), pipelineCtx);
+      } else {
+        const run = await windows.runCorpusWindows({
+          full, raw, fileStat, overBudget, signal,
+          maxWindows: Math.min(windows.CORPUS_WINDOWS_PER_SWEEP, windowsLeft),
+          extract: text => runFactsPipeline(text, pipelineCtx),
+        });
+        windowsLeft -= run.windowsDone;
+        report.corpus_files.push({ file: name, windows_done: run.windowsDone, windows_remaining: run.windowsRemaining });
+        if (run.status !== 'complete') {
+          abortLoop = run.status === 'aborted';
+          skip(CORPUS_WINDOW_SKIP[run.status], abortLoop ? candidates.length - i : 1);
+          continue;
+        }
+        r = run.result;
+      }
 
       // POST-check (adversarial review, same class the harvest FIFO pins):
       // runFactsPipeline returns NORMALLY with partial results when the
@@ -871,6 +920,83 @@ export function armStartupSweep(
   return {
     cancel: () => {
       try { clearT(handle); } catch { /* noop */ }
+    },
+  };
+}
+
+// ── HTTP serve corpus drain [X8, D18] ─────────────────────────────────────
+
+/** Cadence of the `serve --http` corpus drain. */
+export const CORPUS_DRAIN_INTERVAL_MS = 10 * 60_000;
+/** Per-drain budget. The corpus pass stops between items (E-N2), so this bounds how many files one drain starts. */
+export const CORPUS_DRAIN_BUDGET_MS = 60_000;
+
+export interface CorpusDrainOpts {
+  /** Source to sweep. Default 'default'. */
+  sourceId?: string;
+  /** Env for the GBRAIN_SWEEP kill switch. Default process.env. */
+  env?: Record<string, string | undefined>;
+  /** Timer seams (tests). Defaults: global setInterval/clearInterval. */
+  setIntervalFn?: (fn: () => void, ms: number) => unknown;
+  clearIntervalFn?: (handle: unknown) => void;
+  /** Sweep body override (tests). Default: runMaintenanceSweep with CORPUS_DRAIN_BUDGET_MS. */
+  sweep?: (engine: BrainEngine) => Promise<unknown>;
+}
+
+/** True when the corpus dir holds a `.txt` with no `.ingested` sidecar. Missing dir = false. */
+async function corpusHasPendingFiles(engine: BrainEngine): Promise<boolean> {
+  let dir = await engine.getConfig('dream.synthesize.session_corpus_dir');
+  if (!dir) {
+    const { configDir } = await import('./config.ts');
+    dir = join(configDir(), 'transcripts', 'corpus');
+  }
+  const names = await readdir(dir).catch(() => [] as string[]);
+  const present = new Set(names);
+  return names.some(n => n.endsWith('.txt') && !present.has(n + CORPUS_INGESTED_SUFFIX));
+}
+
+/**
+ * X8 (D18): the corpus drain a `serve --http` process owns. A stdio serve
+ * sweeps at startup and on idle ticks; the HTTP serve never swept, so a turn
+ * the serve-side harvest refused (#5557) or a session-end corpus file waited
+ * for a hand-run `gbrain sweep --once` and then for retention GC. Every
+ * CORPUS_DRAIN_INTERVAL_MS, when a corpus file has no `.ingested` sidecar,
+ * one bounded sweep runs under the corpus pass's own gates (keyless skip,
+ * the writeback gate, claims, per-file and per-sweep window caps). Never
+ * overlaps itself; unref'd; never throws. `tick` runs one decision now.
+ * Returns null when GBRAIN_SWEEP=0.
+ */
+export function armCorpusDrain(
+  engine: BrainEngine,
+  opts: CorpusDrainOpts = {},
+): { cancel: () => void; tick: () => Promise<void> } | null {
+  const env = opts.env ?? process.env;
+  if (env.GBRAIN_SWEEP === '0') return null;
+  const setI = opts.setIntervalFn ?? ((fn: () => void, ms: number) => setInterval(fn, ms));
+  const clearI = opts.clearIntervalFn
+    ?? ((h: unknown) => clearInterval(h as ReturnType<typeof setInterval>));
+  const run = opts.sweep
+    ?? ((e: BrainEngine) => runMaintenanceSweep(e, { sourceId: opts.sourceId, budgetMs: CORPUS_DRAIN_BUDGET_MS }));
+  let inFlight = false;
+  let cancelled = false;
+  const tick = async (): Promise<void> => {
+    if (inFlight || cancelled) return;
+    inFlight = true;
+    try {
+      if (await corpusHasPendingFiles(engine)) await run(engine);
+    } catch {
+      /* the drain is best-effort; never kill serve */
+    } finally {
+      inFlight = false;
+    }
+  };
+  const handle = setI(() => { void tick(); }, CORPUS_DRAIN_INTERVAL_MS);
+  (handle as { unref?: () => void } | null)?.unref?.();
+  return {
+    tick,
+    cancel: () => {
+      cancelled = true;
+      try { clearI(handle); } catch { /* noop */ }
     },
   };
 }

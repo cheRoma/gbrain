@@ -51,14 +51,45 @@ export interface GoogleSourceState {
    */
   gmail_backfill_floor_ms: number | null;
   gmail_backfill_done: boolean;
+  /**
+   * #5438 (adopted from #5581): lower bound (epoch ms) the completed backfill
+   * actually covered. A later, WIDER g_history_days reopens the backfill below
+   * it instead of silently leaving the extra history unimported; absent on
+   * legacy state (no reopen).
+   */
+  gmail_backfill_cutoff_ms?: number | null;
+  /**
+   * #5581: history-expired gap: `[gmail_gap_after_ms,
+   * gmail_gap_floor_ms)` is drained newest→oldest with the same resumable floor
+   * walk as the backfill. Both null when no gap is open.
+   */
+  gmail_gap_after_ms?: number | null;
+  gmail_gap_floor_ms?: number | null;
+  /**
+   * #5581: delta threads flagged by an already-consumed history window but
+   * not yet landed (capped: 1,000 ids or 64 KB). An aborted delta drain
+   * advances `gmail_history_id` and parks the remainder here.
+   */
+  gmail_pending_thread_ids?: string[];
   /** Bookmark for the history-expired fallback: newest internalDate imported. */
   gmail_newest_ms: number | null;
   /**
-   * Poison-thread ledger: consecutive fetch failures per thread id. A thread
-   * failing MAX_THREAD_FAILURES times is skipped (loudly) instead of wedging
-   * the backfill floor / delta cursor forever; entries clear on success.
+   * Pre-wave-4 poison-thread ledger (consecutive failures per thread id). Read
+   * once and carried into `item_holds`; never written again.
    */
   gmail_fail_counts?: Record<string, number>;
+  /** Fix wave 4: connector item holds (src/core/connectors/item-holds.ts). */
+  item_holds?: unknown;
+  /**
+   * #5868: threads whose loop a grace window withheld, keyed by thread id
+   * (src/core/google/loop-catchup.ts). Separate from `item_holds`: never a
+   * failure, never counted by doctor `connector_held_items` or `waiting`.
+   */
+  loop_grace_holds?: Record<string, LoopGraceHold>;
+  /** #5868: one-shot 14-day grace-hold backfill done (set after a non-aborted sweep). */
+  loop_grace_backfill_done?: boolean;
+  /** #5867: managed-source 30-day loops_extract catch-up progress. */
+  loops_catchup?: LoopsCatchupState;
   calendar_sync_token: string | null;
   /**
    * Calendar id `calendar_sync_token` was minted for. A token is only valid
@@ -97,6 +128,33 @@ export function deriveSourceId(account: string): string {
     .slice(0, 32)
     .replace(/-+$/, '');
   return id || 'gmail';
+}
+
+/**
+ * #5868: one grace-held thread. `spec` is the loop its last detection would
+ * open at `due_ms`; `rev` is the page's newest message id it was computed
+ * from. A backfill seed has neither and is re-fetched once due.
+ */
+export interface LoopGraceHold {
+  due_ms: number;
+  slug: string | null;
+  rev: string | null;
+  spec: {
+    loopType: 'unanswered_inbound' | 'unanswered_outbound';
+    counterpartyEmail: string;
+    summary: string;
+    evidence: Array<{ message_id?: string; page_slug?: string; quote?: string }>;
+    lastActivityMs: number;
+    openedMs: number;
+  } | null;
+}
+
+/** #5867: the managed catch-up's window floor, its one-retry set and its done marker. */
+export interface LoopsCatchupState {
+  version: 1;
+  floor_ms: number;
+  retried: string[];
+  done: boolean;
 }
 
 export interface GmailMessageMeta {

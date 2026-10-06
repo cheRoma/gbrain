@@ -226,7 +226,11 @@ export interface ExtractInput {
 }
 
 /** A pre-INSERT fact ready for the engine.insertFact path. */
-export type ExtractedFact = NewFact & { entity_slug: string | null };
+export type ExtractedFact = NewFact & {
+  entity_slug: string | null;
+  /** #5836: the subject was inferred at write time (subject-infer-write.ts), not named by the extractor. */
+  entity_inferred?: 'page' | 'mention';
+};
 
 /**
  * Unknown/anonymous-speaker attribution gate.
@@ -345,7 +349,8 @@ export function buildExtractorSystem(admitsLow: boolean): string {
   return admitsLow ? EXTRACTOR_SYSTEM_ADMITS_LOW : EXTRACTOR_SYSTEM_SKIPS_LOW;
 }
 
-const MAX_TURN_TEXT_CHARS = 8000;
+/** Extractor input ceiling; corpus windows (context/corpus-windows.ts) are cut to fit it. */
+export const MAX_TURN_TEXT_CHARS = 8000;
 
 /**
  * #4863 — JSON Schema for the extractor reply, sent as `responseSchema` on
@@ -412,7 +417,7 @@ export type ExtractFactsOutcome =
  * Bounded diagnostic breadcrumb for the message: the cause's CONSTRUCTOR name
  * (validated as a plain identifier — never `.name`, never `.message`) plus
  * the whole-run class `classifyGlobalLlmError` derives from the cause chain
- * (`auth` / `billing` / `rate_limit`, the same vocabulary ingest_log uses).
+ * (`auth` / `billing` / `rate_limit` / `model_not_found`, the same vocabulary ingest_log uses).
  * Both are closed vocabularies with no interpolated provider text, so a 4xx
  * body echoing a key / org id cannot ride through. Defense-in-depth, not a
  * hard boundary: anything unexpected is dropped (never substituted), and a
@@ -633,6 +638,10 @@ export async function extractFactsFromTurnWithOutcome(
 
   const facts: ExtractedFact[] = [];
   let junkSkipped = 0;
+  // A caller that resolved the brain's signature passes it (or null); otherwise a brain that opted out of embedding
+  // never has its fact text sent to the provider.
+  const { factEmbeddingDisabled } = await import('../embedding-disabled.ts');
+  const embedFacts = input.embedding !== null && (input.embedding !== undefined || !await factEmbeddingDisabled(input.engine));
   for (const candidate of parsedRaw.slice(0, cap)) {
     if (input.abortSignal?.aborted) {
       const e = new Error('aborted');
@@ -668,7 +677,7 @@ export async function extractFactsFromTurnWithOutcome(
     let embedding: Float32Array | null = null;
     let embeddingModel: string | null = null;
     try {
-      if (input.embedding !== null) {
+      if (embedFacts) {
         embeddingModel = input.embedding?.model ?? getEmbeddingModel();
         embedding = await embedOne(factText, { abortSignal: input.abortSignal, inputType: 'document', embeddingModel,
           ...(input.embedding ? { embeddingModel: input.embedding.model, dimensions: input.embedding.dimensions } : {}) });

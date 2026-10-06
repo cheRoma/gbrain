@@ -32,6 +32,7 @@ import {
   saveBackupStatus,
   type BackupStatus,
 } from '../src/core/backup/status-file.ts';
+import { surfaceSource } from './helpers/source-surface.ts';
 
 /** The exact literal thrown by src/core/pglite-engine.ts on lock contention.
  * isLockError in src/commands/backup.ts matches on the leading substring —
@@ -314,7 +315,7 @@ describe('runBackupCli — PGLite lock fallback', () => {
   });
 
   test('source-text contract pin: pglite-engine still throws the literal isLockError matches', () => {
-    const engineSrc = readFileSync(join(import.meta.dir, '..', 'src', 'core', 'pglite-engine.ts'), 'utf-8');
+    const engineSrc = surfaceSource('pglite-engine');
     expect(engineSrc).toContain(LOCK_SUBSTRING);
     // And backup.ts matches on exactly that substring — drift on either side
     // silently breaks the serve-cohort fallback, so pin both.
@@ -374,6 +375,30 @@ describe('runBackupCli — disabled', () => {
     expect(r.stdout).toContain('backup check disabled — verdict from cache only');
     // …but no 'status' nag impression is recorded while disabled.
     expect(existsSync(nagPath)).toBe(false);
+  });
+});
+
+// #5505: rows coverage leaves without fix_argv still get a command.
+describe('runBackupCli status: fix commands for dirty and unverified rows', () => {
+  test('dirty repo, deduped dirty root, dirty workspace and unverified repo each name a fix', async () => {
+    process.env.GBRAIN_BACKUP_CHECK = '0'; // cache-only render, no compute
+    saveBackupStatus({
+      ...mkStatus('warn', new Date(Date.now() - 60_000).toISOString()),
+      assets: [
+        { kind: 'source_repo', id: 'dirty-src', state: 'dirty', detail: 'uncommitted changes', fix_argv: null },
+        { kind: 'source_repo', id: 'root-a, root-b', state: 'dirty', detail: 'uncommitted changes', fix_argv: null },
+        { kind: 'bootstrap_workspace', id: '/ws/example', state: 'dirty', detail: 'uncommitted changes', fix_argv: null },
+        { kind: 'source_repo', id: 'unverified-src', state: 'ok', configured_remote: true, fix_argv: null },
+      ],
+    });
+
+    const r = await run(['status'], thunkFor(stubEngine({})).connect);
+
+    expect(r.stdout).toContain('fix: gbrain sources push dirty-src');
+    expect(r.stdout).toContain('fix: gbrain sources push root-a\n');
+    expect(r.stdout).toContain('fix: gbrain sources push --path /ws/example');
+    expect(r.stdout).toContain('fix: gbrain backup check');
+    expect(r.stdout).toContain('Fix the ✗ and ⚠ rows above, then run: gbrain backup check');
   });
 });
 

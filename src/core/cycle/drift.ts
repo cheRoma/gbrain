@@ -23,13 +23,14 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
-import { BudgetMeter, loadAllowUnpriced, parseBudgetUsd } from './budget-meter.ts';
+import { BudgetMeter, loadAllowUnpriced, loadPricingOverrides, parseBudgetUsd } from './budget-meter.ts';
 import { resolveSynthMaxOutputTokens } from './synthesize-concepts.ts';
 import { resolveCycleDate, shiftCalendarDate } from './cycle-date.ts';
 import { resolveModel } from '../model-config.ts';
 import type { DreamPhaseResult } from './auto-think.ts';
 import { maintenancePreflight, publishMaintenancePage } from '../persistence/prepared-maintenance.ts';
 import { serializeMarkdown } from '../markdown.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 
 export interface DriftPhaseOpts {
   brainDir?: string;
@@ -174,6 +175,7 @@ export async function defaultDriftJudge(input: {
     messages: [{ role: 'user', content: buildDriftPrompt(input.candidate, input.evidence) }],
     ...(input.modelHint ? { model: input.modelHint } : {}),
     maxTokens: input.maxOutputTokens ?? resolveSynthMaxOutputTokens(input.modelHint ?? ''),
+    allowFallback: false,
   });
   const parsed = parseDriftOutput(result.text);
   if (!parsed) {
@@ -325,6 +327,7 @@ export async function runPhaseDrift(
   const meter = new BudgetMeter({
     budgetUsd: config.budgetUsd,
     allowUnpriced: config.allowUnpriced,
+    pricingOverrides: await loadPricingOverrides(engine),
     phase: 'drift',
     auditPath: opts.auditPath,
   });
@@ -362,18 +365,20 @@ export async function runPhaseDrift(
   if (judged.length > 0) {
     reportSlug = `reports/drift-${cycleDate}`;
     // Report-only v1: the report page is the ONLY write this phase makes.
+    // Typed `note` (+ report_type) so the default pack declares it (#5881).
     // Lands in the default source (brain-global artifact, same-day re-runs
     // upsert the same slug).
     if (maintenance) {
       const snapshot = await engine.readPageSnapshot(reportSlug, { sourceId: 'default' });
-      await publishMaintenancePage(engine, maintenance, reportSlug, serializeMarkdown({}, buildReportBody(judged, config, modelId), '',
-        { type: 'report', title: `Drift report ${cycleDate}`, tags: [] }), { expectedRevision: snapshot?.revision ?? null, file: false });
+      await publishMaintenancePage(engine, maintenance, reportSlug, serializeMarkdown({ report_type: 'drift' }, buildReportBody(judged, config, modelId), '',
+        { type: 'note', title: `Drift report ${cycleDate}`, tags: [] }), { expectedRevision: snapshot?.revision ?? null, file: false });
     } else {
-      await engine.putPage(reportSlug, {
-        type: 'report',
+      await maintenanceTransaction(engine, tx => tx.putPage(reportSlug!, {
+        type: 'note',
+        frontmatter: { report_type: 'drift' },
         title: `Drift report ${cycleDate}`,
         compiled_truth: buildReportBody(judged, config, modelId),
-      });
+      }));
     }
   }
 

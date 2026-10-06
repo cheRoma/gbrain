@@ -62,6 +62,9 @@ export const HANDLER_DEFAULT_TIMEOUT_MS: Readonly<Record<string, number>> = {
   // #2194 fix #3: brain-wide maintenance (embed-all/orphans/purge/…) can run
   // longer than a single source cycle; give it the same 30-min budget.
   'autopilot-global-maintenance': THIRTY_MIN_MS,
+  // #5761: a brain-wide `extract --stale` pass (the remediation plan submits it
+  // without --timeout-ms) walks every stale page; same 30-min budget.
+  extract: THIRTY_MIN_MS,
   // v0.42.x (#2390) — Life Chronicle: one page = one LLM extraction call + a
   // few writes. Generous 10-min budget (vs the tight null-default) covers a
   // slow gateway without the 30-min loop budget.
@@ -123,4 +126,20 @@ export const LOCK_DURATION_MS_MAX = 3_600_000;
 
 export function clampLockDurationMs(raw: number): number {
   return Math.max(LOCK_DURATION_MS_MIN, Math.min(LOCK_DURATION_MS_MAX, Math.floor(raw)));
+}
+
+/**
+ * Per-turn chat timeout for subagent jobs (#4921), `ai.chat.per_turn_timeout_ms`.
+ * The gateway's default chat backstop (300 s) killed long thinking-model
+ * turns inside a 30-min job, and the replay retried into the same wall.
+ * A subagent turn instead gets this cap (default: the 30-min subagent
+ * budget); the job's own signal still aborts at its deadline, so a turn ends
+ * at whichever comes first. Calls outside a job keep the 300 s backstop.
+ */
+export const DEFAULT_CHAT_PER_TURN_TIMEOUT_MS = THIRTY_MIN_MS;
+
+/** The configured per-turn cap, or the default when unset or not a positive integer. */
+export function resolveChatPerTurnTimeoutMs(raw: string | null | undefined): number {
+  const n = raw == null || raw.trim() === '' ? NaN : Number(raw);
+  return Number.isSafeInteger(n) && n > 0 ? n : DEFAULT_CHAT_PER_TURN_TIMEOUT_MS;
 }
