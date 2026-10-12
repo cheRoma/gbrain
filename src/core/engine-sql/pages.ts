@@ -14,13 +14,15 @@
  */
 import type { BrainEngine } from '../engine.ts';
 import type { DomainBankSampleOpts, CorpusSampleOpts, DomainBankRow } from '../types.ts';
-import type { Page, PageInput, PageFilters, PageVersion, StalePageRow } from '../types.ts';
+import type { Page, PageInput, PageFilters, StalePageRow } from '../types.ts';
+import type { GetVersionsOpts, PageVersionRows } from '../page-state/version-types.ts';
 import { PAGE_SORT_SQL } from '../types.ts';
 import type { PageWriteOptions } from '../page-state/types.ts';
 import { moveSlugBindings, recordRenameAlias } from '../page-state/rename-alias.ts';
 import { sanitizeText } from '../batch-rows.ts';
 import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion } from '../search/safe-chunks.ts';
 import { privatePagesFilterFragment, privateSnapshotFilterFragment } from '../search/private-visibility.ts';
+import { quarantineFilterFragment } from '../quarantine.ts';
 import { validateSlug, contentHash, isBlankBody, rowToPage, rowToStalePage, isUndefinedTableError, warnOncePerProcess } from '../utils.ts';
 import { DELETE_BATCH_SIZE } from '../engine-constants.ts';
 import { jsonbParam, type SqlExecutor } from './executor.ts';
@@ -57,6 +59,31 @@ export async function findDuplicatePage(
       const r = rows[0];
       return { slug: r.slug, id: Number(r.id) };
   }
+
+/**
+ * GBRA-75 wave 10: `findDuplicatePage` for several inputs of one source in one statement. Entry i is the row the
+ * single call returns for `inputs[i]`: the same predicate, the same order and the first row per input.
+ */
+export async function findDuplicatePages(
+  exec: ScopedRead,
+  sourceId: string,
+  inputs: ReadonlyArray<{ hash: string; frontmatterId?: string | null; excludeSlug?: string }>,
+): Promise<Array<{ slug: string; id: number } | null>> {
+  if (!inputs.length) return [];
+  const { rows } = await exec.run<{ n: number | string; id: number | string; slug: string }>(sqlFragment`
+    SELECT DISTINCT ON (k.n) k.n, p.id, p.slug
+    FROM jsonb_to_recordset(${JSON.stringify(inputs.map((input, i) => ({ n: i + 1, hash: input.hash, frontmatter_id: input.frontmatterId ?? null,
+      exclude_slug: input.excludeSlug ?? null })))}::text::jsonb) AS k(n int, hash text, frontmatter_id text, exclude_slug text)
+    JOIN pages p ON p.source_id = ${sourceId}
+      AND p.deleted_at IS NULL
+      AND (p.content_hash = k.hash OR (p.frontmatter->>'id' = k.frontmatter_id AND k.frontmatter_id IS NOT NULL))
+      AND (k.exclude_slug IS NULL OR p.slug <> k.exclude_slug)
+    ORDER BY k.n, (p.frontmatter->>'id' IS NOT DISTINCT FROM k.frontmatter_id) DESC, p.id
+  `);
+  const found: Array<{ slug: string; id: number } | null> = inputs.map(() => null);
+  for (const row of rows) found[Number(row.n) - 1] = { slug: row.slug, id: Number(row.id) };
+  return found;
+}
 
 export async function putPage(
   exec: SqlExecutor,
@@ -117,10 +144,17 @@ export async function putPage(
     const sourceUri = page.source_uri ?? null;
     const ingestedVia = page.ingested_via ?? null;
     const ingestedAt = (sourceKind || sourceUri || ingestedVia) ? new Date() : null;
+    // #5984: the contextual retrieval stamp, when the caller passes it, rides in this statement.
+    const cr = opts?.contextualRetrieval && opts.contextualRetrieval.mode !== 'none' ? opts.contextualRetrieval : null;
+    const crColumns = cr ? sqlFragment`, contextual_retrieval_mode, corpus_generation` : sqlFragment``;
+    const crValues = cr ? sqlFragment`, ${cr.mode}, ${cr.corpusGeneration}` : sqlFragment``;
+    const crSet = cr ? sqlFragment`
+        contextual_retrieval_mode = EXCLUDED.contextual_retrieval_mode,
+        corpus_generation     = EXCLUDED.corpus_generation,` : sqlFragment``;
     const { rows } = await exec.run(sqlFragment`
-      INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
-      VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${sanitizeText(page.title)}, ${sanitizeText(page.compiled_truth)}, ${sanitizeText(page.timeline || '')}, ${jsonbParam(frontmatter)}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, ${chunkerVersion}::smallint, ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt})
-      ON CONFLICT (source_id, slug) DO UPDATE SET
+      INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at${crColumns})
+      VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${sanitizeText(page.title)}, ${sanitizeText(page.compiled_truth)}, ${sanitizeText(page.timeline || '')}, ${jsonbParam(frontmatter)}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, ${chunkerVersion}::smallint, ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt}${crValues})
+      ON CONFLICT (source_id, slug) DO UPDATE SET${crSet}
         type = EXCLUDED.type,
         page_kind = EXCLUDED.page_kind,
         title = EXCLUDED.title,
@@ -241,7 +275,7 @@ export async function restorePage(exec: SqlExecutor, slug: string, opts?: { sour
     const sourceId = opts?.sourceId;
     const sourceCondition = sourceId ? sqlFragment`AND source_id = ${sourceId}` : sqlFragment``;
     const { rows } = await exec.run(sqlFragment`
-      UPDATE pages SET deleted_at = NULL
+      UPDATE pages SET deleted_at = NULL, updated_at = now()
       WHERE slug = ${slug} AND deleted_at IS NOT NULL ${sourceCondition}
       RETURNING slug
     `);
@@ -338,7 +372,7 @@ export async function updatePageContextualRetrievalState(
           RETURNING p.id, previous.old_mode, previous.skipped
         )
         UPDATE content_chunks cc SET ${vector}=NULL, embedded_at=NULL,
-          embedded_text_hash=NULL, embedding_input_hash=NULL
+          embedded_text_hash=NULL, embedding_input_hash=NULL, embedding_pending_since=now()
         FROM changed WHERE cc.page_id=changed.id
           AND changed.old_mode IN ('title','per_chunk_synopsis') AND NOT changed.skipped
           AND cc.${vector} IS NOT NULL`);
@@ -387,6 +421,10 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
     const slugCondition = slugPrefix
       ? sqlFragment`AND p.slug LIKE ${slugPrefix.replace(/[\\%_]/g, (c) => '\\' + c) + '%'} ESCAPE '\\'`
       : sqlFragment``;
+    // #6500 slug keyset (single-source contract, see PageFilters.slugAfter).
+    const slugAfterCondition = filters?.slugAfter !== undefined
+      ? sqlFragment`AND p.slug > ${filters.slugAfter}`
+      : sqlFragment``;
     // v0.31.12 + v0.34.1 (#876, D9): scope to a single source OR an array
     // of sources. When BOTH are set, the array wins (federated semantics
     // subsume the scalar case). When neither is set, no filter applies.
@@ -421,7 +459,7 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
       const { rows } = await exec.run(sqlFragment`
         SELECT ${columns}, to_char(p.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso FROM pages p
         ${tagJoin}
-        WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition} ${sourceCondition} ${deletedCondition} ${privateCondition} ${effectiveAfterCondition} ${effectiveBeforeCondition}
+        WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition} ${slugAfterCondition} ${sourceCondition} ${deletedCondition} ${privateCondition} ${effectiveAfterCondition} ${effectiveBeforeCondition}
         ORDER BY ${orderBy} LIMIT ${limit} OFFSET ${offset}
       `);
       return rows.map(rowToPage);
@@ -499,10 +537,11 @@ export async function listPrefixSampledPages(scoped: ScopedReadRunner, opts: Dom
           p.source_id,
           p.title,
           p.compiled_truth,
-          p.last_retrieved_at,
+          GREATEST(p.last_retrieved_at, r.last_retrieved_at) AS last_retrieved_at,
           substring(p.slug from '^[^/]+/[^/]+') AS prefix,
           COUNT(pl.id) AS connection_count
         FROM pages p
+        LEFT JOIN page_retrievals r ON r.page_id = p.id
         LEFT JOIN page_links pl ON pl.to_page_id = p.id
         WHERE p.deleted_at IS NULL
           AND substring(p.slug from '^[^/]+/[^/]+') = ANY(${opts.prefixes}::text[])
@@ -512,7 +551,7 @@ export async function listPrefixSampledPages(scoped: ScopedReadRunner, opts: Dom
             OR (${sourceIds}::text[] IS NULL AND ${sourceId}::text IS NOT NULL AND p.source_id = ${sourceId})
             OR (${sourceIds}::text[] IS NULL AND ${sourceId}::text IS NULL)
           )
-        GROUP BY p.id, p.slug, p.source_id, p.title, p.compiled_truth, p.last_retrieved_at
+        GROUP BY p.id, p.slug, p.source_id, p.title, p.compiled_truth, p.last_retrieved_at, r.last_retrieved_at
       ),
       ranked AS (
         SELECT
@@ -585,10 +624,11 @@ export async function listCorpusSample(scoped: ScopedReadRunner, opts: CorpusSam
           p.source_id,
           p.title,
           p.compiled_truth,
-          p.last_retrieved_at,
+          GREATEST(p.last_retrieved_at, r.last_retrieved_at) AS last_retrieved_at,
           substring(p.slug from '^[^/]+/[^/]+') AS prefix,
           (SELECT COUNT(*) FROM page_links pl WHERE pl.to_page_id = p.id) AS connection_count
         FROM pages p
+        LEFT JOIN page_retrievals r ON r.page_id = p.id
         WHERE p.deleted_at IS NULL
           AND (cardinality(${exclude}::text[]) = 0 OR NOT (p.slug = ANY(${exclude}::text[])))
           AND (
@@ -650,6 +690,19 @@ export async function resolveSlugs(
 // ── v0.42.7 (#1696): link/timeline extraction freshness watermark ──
 
 /**
+ * Origins of wanted links whose target now exists: a live page with the wanted
+ * slug (or, for a bare-name reference, the wanted basename) updated after the
+ * origin last resolved it. Their next extraction creates the edge
+ * (src/core/wanted-links.ts).
+ */
+const WANTED_ORIGIN_IS_STALE = sqlFragment`id IN (SELECT w.origin_page_id FROM wanted_links w
+      JOIN pages t ON t.source_id = w.target_source_id AND t.slug = w.target_ref AND t.deleted_at IS NULL
+      WHERE t.updated_at > w.checked_at
+    UNION SELECT w.origin_page_id FROM wanted_links w
+      JOIN pages t ON t.source_id = w.target_source_id AND regexp_replace(t.slug, '^.*/', '') = w.target_ref AND t.deleted_at IS NULL
+      WHERE w.ref_kind = 'name' AND t.updated_at > w.checked_at)`;
+
+/**
  * Shared stale-for-extraction predicate. `attendance` narrows it by the #5761
  * marker: a page is attendance-blocked while its marker equals its current
  * knowledge revision. Extraction itself never passes it, so it keeps
@@ -657,13 +710,14 @@ export async function resolveSlugs(
  */
 function stalePagesWhere(opts?: { sourceId?: string; versionTs?: string; attendance?: 'exclude' | 'blocked' }) {
   const version = opts?.versionTs
-    ? sqlFragment`(links_extracted_at IS NULL OR links_extracted_at < ${opts.versionTs}::timestamptz OR updated_at > links_extracted_at)`
-    : sqlFragment`(links_extracted_at IS NULL OR updated_at > links_extracted_at)`;
+    ? sqlFragment`(links_extracted_at IS NULL OR links_extracted_at < ${opts.versionTs}::timestamptz OR updated_at > links_extracted_at OR ${WANTED_ORIGIN_IS_STALE})`
+    : sqlFragment`(links_extracted_at IS NULL OR updated_at > links_extracted_at OR ${WANTED_ORIGIN_IS_STALE})`;
   const source = opts?.sourceId ? sqlFragment` AND source_id = ${opts.sourceId}` : sqlFragment``;
   const attendance = opts?.attendance === 'exclude'
     ? sqlFragment` AND links_attendance_blocked_revision IS DISTINCT FROM knowledge_revision`
     : opts?.attendance === 'blocked' ? sqlFragment` AND links_attendance_blocked_revision = knowledge_revision` : sqlFragment``;
-  return sqlFragment`deleted_at IS NULL AND ${version}${source}${attendance}`;
+  // A quarantined page is hidden from search; it is neither re-extracted nor counted as stale.
+  return sqlFragment`deleted_at IS NULL AND ${trustedSql(quarantineFilterFragment('pages'))} AND ${version}${source}${attendance}`;
 }
 
 export async function countStalePagesForExtraction(exec: ScopedRead, opts?: { sourceId?: string; versionTs?: string; attendance?: 'exclude' | 'blocked' }): Promise<number> {
@@ -735,6 +789,44 @@ export async function markPagesAttendanceBlocked(
     return result.affectedRows;
   }
 
+/**
+ * #6454: live pages whose stored frontmatter still carries one of the parser's
+ * reserved top-level keys (`type`, `title`, `tags`, `slug`; older imports kept
+ * them). Not drift since `comparableFrontmatter` (markdown.ts), but hygiene
+ * `gbrain repair frontmatter-keys` sweeps on consent. Counts per source for
+ * the doctor check; the listing pages by id for the preview-bound sweep.
+ */
+export const RESERVED_FRONTMATTER_KEYS_SQL = ['type', 'title', 'tags', 'slug'];
+const normalizeStaleKeyCount = compileRowNormalizer<{ source_id: string; n: number }>({ n: 'bigint' });
+export async function countStaleFrontmatterKeyPages(exec: ScopedRead, opts: { sourceIds: string[] }): Promise<Array<{ source_id: string; n: number }>> {
+    if (opts.sourceIds.length === 0) return [];
+    const { rows } = await exec.run<{ source_id: string; n: number | string }>(sqlFragment`
+      SELECT source_id, count(*)::bigint AS n FROM pages
+      WHERE source_id = ANY(${opts.sourceIds}::text[]) AND deleted_at IS NULL AND frontmatter ?| ${RESERVED_FRONTMATTER_KEYS_SQL}::text[]
+      GROUP BY source_id ORDER BY source_id
+    `);
+    return rows.map(row => normalizeStaleKeyCount(row));
+  }
+export async function listStaleFrontmatterKeyPages(exec: ScopedRead, opts: { sourceId: string; afterId: number; limit: number }):
+  Promise<Array<{ id: number; slug: string; keys: string[] }>> {
+    const { rows } = await exec.run<{ id: number | string; slug: string; keys: string[] }>(sqlFragment`
+      SELECT id, slug, ARRAY(SELECT k FROM unnest(${RESERVED_FRONTMATTER_KEYS_SQL}::text[]) AS k WHERE frontmatter ? k ORDER BY k) AS keys
+      FROM pages
+      WHERE source_id = ${opts.sourceId} AND deleted_at IS NULL AND frontmatter ?| ${RESERVED_FRONTMATTER_KEYS_SQL}::text[] AND id > ${opts.afterId}
+      ORDER BY id LIMIT ${opts.limit}
+    `);
+    return rows.map(row => ({ id: Number(row.id), slug: row.slug, keys: row.keys }));
+  }
+/** Strips the reserved keys from the named live pages of one source; the revision trigger advances each changed row. */
+export async function stripStaleFrontmatterKeys(exec: SqlExecutor, opts: { sourceId: string; ids: number[] }): Promise<number> {
+    if (opts.ids.length === 0) return 0;
+    const result = await exec.run(sqlFragment`
+      UPDATE pages SET frontmatter = frontmatter - ${RESERVED_FRONTMATTER_KEYS_SQL}::text[]
+      WHERE source_id = ${opts.sourceId} AND id = ANY(${opts.ids}::int[]) AND deleted_at IS NULL AND frontmatter ?| ${RESERVED_FRONTMATTER_KEYS_SQL}::text[]
+    `);
+    return result.affectedRows;
+  }
+
 export async function findByTitleFuzzy(
   exec: LegacyUnscopedRead,
   name: string,
@@ -802,42 +894,35 @@ export async function getPageTimestamps(exec: LegacyUnscopedRead, slugs: string[
  */
 const PAGE_VERSION_COLUMNS = trustedSql('pv.id, pv.page_id, pv.compiled_truth, pv.frontmatter, pv.snapshot_at, pv.knowledge_revision, '
   + 'pv.timeline, pv.title, pv.type, pv.tags, pv.is_deleted, pv.source_path');
+const PAGE_VERSION_METADATA_COLUMNS = trustedSql('pv.id, pv.page_id, pv.frontmatter, pv.snapshot_at, pv.knowledge_revision, '
+  + 'pv.title, pv.type, pv.tags, pv.is_deleted, pv.source_path');
 
-export async function getVersions(
+/**
+ * Newest first (`pv.id` breaks snapshot_at ties). Scope and privacy
+ * predicates sit in WHERE, so `limit` bounds only rows the caller may read;
+ * `includeBody: false` never selects the body columns.
+ */
+export async function getVersions<B extends boolean = true>(
   exec: LegacyUnscopedRead,
   slug: string,
-  opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean },
-): Promise<PageVersion[]> {
+  opts?: GetVersionsOpts<B>,
+): Promise<PageVersionRows<B>> {
     const privacy = opts?.excludePrivate
       ? trustedSql(`AND ${privatePagesFilterFragment('p')} AND ${privateSnapshotFilterFragment('pv')}`) : sqlFragment``;
-    if (opts?.sourceIds && opts.sourceIds.length > 0) {
-      const { rows } = await exec.run<PageVersion>(sqlFragment`
-        SELECT ${PAGE_VERSION_COLUMNS} FROM page_versions pv
-        JOIN pages p ON p.id = pv.page_id
-        WHERE p.slug = ${slug} AND p.source_id = ANY(${opts.sourceIds}::text[])
-          ${privacy}
-        ORDER BY pv.snapshot_at DESC
-      `);
-      return rows;
-    }
-    if (opts?.sourceId) {
-      const { rows } = await exec.run<PageVersion>(sqlFragment`
-        SELECT ${PAGE_VERSION_COLUMNS} FROM page_versions pv
-        JOIN pages p ON p.id = pv.page_id
-        WHERE p.slug = ${slug} AND p.source_id = ${opts.sourceId}
-          ${privacy}
-        ORDER BY pv.snapshot_at DESC
-      `);
-      return rows;
-    }
-    const { rows } = await exec.run<PageVersion>(sqlFragment`
-      SELECT ${PAGE_VERSION_COLUMNS} FROM page_versions pv
+    const scope = opts?.sourceIds && opts.sourceIds.length > 0
+      ? sqlFragment`AND p.source_id = ANY(${opts.sourceIds}::text[])`
+      : opts?.sourceId ? sqlFragment`AND p.source_id = ${opts.sourceId}` : sqlFragment``;
+    const columns = opts?.includeBody === false ? PAGE_VERSION_METADATA_COLUMNS : PAGE_VERSION_COLUMNS;
+    const limit = opts?.limit !== undefined ? sqlFragment`LIMIT ${opts.limit}` : sqlFragment``;
+    const { rows } = await exec.run(sqlFragment`
+      SELECT ${columns} FROM page_versions pv
       JOIN pages p ON p.id = pv.page_id
-      WHERE p.slug = ${slug}
+      WHERE p.slug = ${slug} ${scope}
         ${privacy}
-      ORDER BY pv.snapshot_at DESC
+      ORDER BY pv.snapshot_at DESC, pv.id DESC
+      ${limit}
     `);
-    return rows;
+    return rows as PageVersionRows<B>;
   }
 
 export async function revertToVersion(

@@ -91,23 +91,26 @@ const KNOWN_MODEL_RENAMES: Readonly<Record<string, string>> = {
 /**
  * Recovery text for a provider 404 (`model_not_found`): the model id and
  * provider from the call context (`chat(provider:model)`), the command that
- * lists the configured routes, and a known rename when there is one.
+ * lists the configured routes, a known rename when there is one and, #5304,
+ * `routeHint`: the sentence naming the config key that selected the model
+ * (`model-not-found-hint.ts`), appended when the caller knows it.
  */
-export function modelNotFoundFix(context: string | undefined): string {
+export function modelNotFoundFix(context: string | undefined, routeHint = ''): string {
   const model = context?.match(/\(([^()\s]+:[^()\s]+)\)\s*$/)?.[1];
   const provider = model?.slice(0, model.indexOf(':'));
   const rename = model ? KNOWN_MODEL_RENAMES[model] : undefined;
   return `Check the model id: ${model ? `the ${provider} provider does not serve ${model}` : 'the provider does not serve this model'}, or this key has no access to it. ` +
     'Run `gbrain models` to see the configured model routes, then set a model the provider lists.' +
-    (rename ? ` ${model} was renamed: use ${rename}.` : '');
+    (rename ? ` ${model} was renamed: use ${rename}.` : '') +
+    (routeHint ? ` ${routeHint}` : '');
 }
 
 /**
  * `redact` scrubs upstream text before it becomes the message, and in the
  * wrapped error (#5137: the gateway passes its provider-key redactor, since
- * auth errors echo keys).
+ * auth errors echo keys). `routeHint` (#5304) is appended to a 404's fix only.
  */
-export function normalizeAIError(err: unknown, context?: string, redact?: (text: string) => string): AIServiceError {
+export function normalizeAIError(err: unknown, context?: string, redact?: (text: string) => string, routeHint = ''): AIServiceError {
   if (redact) scrubErrorChain(err, redact);
   if (err instanceof AIServiceError) return err;
 
@@ -131,13 +134,13 @@ export function normalizeAIError(err: unknown, context?: string, redact?: (text:
   const msg = redact ? redact(raw) : raw;
   const ctxPrefix = context ? `[${context}] ` : '';
 
-  // 4xx (except 429) = config-level, non-retryable
+  // 4xx (except 429) = config-level, non-retryable. A 403 whose body says the
+  // project has no access to the model is a model problem, not a key problem.
   if (typeof status === 'number' && status >= 400 && status < 500 && status !== 429) {
     return carryStatusFields(err, new AIConfigError(
       `${ctxPrefix}${msg}`,
-      status === 401 || status === 403
-        ? 'Check your API key is valid and has access to this model.'
-        : status === 404 ? modelNotFoundFix(context)
+      status === 404 || MODEL_NOT_FOUND_MESSAGE_RE.test(msg) ? modelNotFoundFix(context, routeHint)
+        : status === 401 || status === 403 ? 'Check your API key is valid and has access to this model.'
         : 'Check your model id + provider options match the provider API.',
       err,
     ));
@@ -230,10 +233,13 @@ const BILLING_MESSAGE_RE =
 const AUTH_MESSAGE_RE =
   /authentication_error|permission_error|invalid (?:x-)?api[-_ ]?key|api key (?:is )?(?:invalid|expired|missing)|unauthorized/i;
 const RATE_MESSAGE_RE = /rate[-_ ]?limit(?:ed|_error)?\b|too many requests/i;
-// Provider 404 phrasings for an unknown or inaccessible model (OpenAI
-// `model_not_found` / "does not exist or you do not have access", Anthropic
-// `not_found_error`), for errors that carry no numeric 404.
-const MODEL_NOT_FOUND_MESSAGE_RE = /\bmodel_not_found\b|\bnot_found_error\b|does not exist or you do not have access/i;
+// Provider phrasings for an unknown or inaccessible model: OpenAI
+// `model_not_found` / "does not exist or you do not have access" (404),
+// Anthropic `not_found_error`, and the project-level access denial OpenAI
+// returns as a 403 ("Project … does not have access to model …", #5394).
+// Tested before the status map, so the denial is not reported as a bad key.
+const MODEL_NOT_FOUND_MESSAGE_RE =
+  /\bmodel_not_found\b|\bnot_found_error\b|does not exist or you do not have access|(?:does not|doesn't|do not|don't) have access to (?:the |this )?model/i;
 // Structured status forms only; a bare number in prose ("processed 429
 // pages") never matches either shape. The quoted-JSON form
 // (`"api_error_status":429`, the claude-cli result blob) cannot occur as free
@@ -255,6 +261,48 @@ function numericStatusOf(e: unknown): number | undefined {
 }
 
 /**
+ * The layers of a thrown provider error, outermost first. chat() throws the
+ * gateway's normalized error with the provider's own error on `cause`; the AI
+ * SDK's RetryError keeps the final attempt on `lastError` instead. Objects
+ * only, and the walk stops after `limit` layers or at a layer already seen,
+ * so a self-referencing chain cannot loop.
+ */
+function* wrappedErrorLayers(err: unknown, limit = 5): Generator<Record<string, unknown>> {
+  const seen = new Set<object>();
+  let layer = err;
+  while (layer !== null && typeof layer === 'object' && seen.size < limit && !seen.has(layer)) {
+    seen.add(layer);
+    const fields = layer as Record<string, unknown>;
+    yield fields;
+    layer = fields.cause ?? fields.lastError;
+  }
+}
+
+/** What a thrown provider error reports about itself once its wrappers are opened (#5964). */
+export interface ProviderFailureSignals {
+  /** The first finite numeric HTTP status on any layer (see numericStatusOf), outermost first. */
+  status: number | undefined;
+  /** String `name` values on the layers, outermost first (e.g. `TimeoutError`). */
+  names: string[];
+  /** String `code` values on the layers, outermost first (e.g. `ECONNRESET`). */
+  codes: string[];
+}
+
+export function readProviderFailureSignals(err: unknown): ProviderFailureSignals {
+  const signals: ProviderFailureSignals = { status: undefined, names: [], codes: [] };
+  try {
+    for (const layer of wrappedErrorLayers(err)) {
+      signals.status ??= numericStatusOf(layer);
+      if (typeof layer.name === 'string') signals.names.push(layer.name);
+      if (typeof layer.code === 'string') signals.codes.push(layer.code);
+    }
+  } catch {
+    // A throwing getter on a wrapped error ends the walk; what was read stands.
+  }
+  return signals;
+}
+
+/**
  * Did the provider refuse the request BECAUSE of its `response_format:
  * json_schema` (an Ollama build predating structured outputs, a strict proxy
  * rejecting the schema shape) — as opposed to failing for any other reason?
@@ -270,12 +318,9 @@ const STRUCTURED_OUTPUT_REJECTION_RE = /response_format|json_schema|structured[ 
 export function isStructuredOutputRejection(err: unknown): boolean {
   let status: number | undefined;
   let named = false;
-  let cur: unknown = err;
-  for (let depth = 0; cur && typeof cur === 'object' && depth < 5; depth++) {
-    const e = cur as { message?: unknown; responseBody?: unknown; cause?: unknown; lastError?: unknown };
-    status ??= numericStatusOf(e);
-    named ||= [e.message, e.responseBody].some(t => typeof t === 'string' && STRUCTURED_OUTPUT_REJECTION_RE.test(t));
-    cur = e.cause ?? e.lastError;
+  for (const layer of wrappedErrorLayers(err)) {
+    status ??= numericStatusOf(layer);
+    named ||= [layer.message, layer.responseBody].some(t => typeof t === 'string' && STRUCTURED_OUTPUT_REJECTION_RE.test(t));
   }
   if (status !== undefined && (status < 400 || status >= 500 || status === 429)) return false;
   return named;
@@ -300,7 +345,9 @@ function statusToClass(status: number): GlobalLlmErrorClass | null {
  * halt instead of accumulating one swallowed warning per item.
  *
  * Matching is conservative by design: numeric status properties on the error
- * (or its `cause` chain), STRUCTURED status forms in the message, or specific
+ * (or its `cause` chain, falling back to RetryError's `lastError`, where the
+ * AI SDK keeps the final attempt's status once its retries are spent:
+ * #5473), STRUCTURED status forms in the message, or specific
  * provider phrases. Plain 400s (context length, malformed request) stay
  * per-item — they can genuinely differ page to page. Billing phrases outrank
  * a 429 status because a monthly spend limit surfaces as 429 but is a billing
@@ -316,7 +363,8 @@ export function classifyGlobalLlmError(err: unknown): GlobalLlmErrorClass | null
     else if (typeof (cur as { message?: unknown }).message === 'string') {
       messages.push((cur as { message: string }).message);
     }
-    cur = (cur as { cause?: unknown }).cause;
+    const next = cur as { cause?: unknown; lastError?: unknown };
+    cur = next.cause ?? next.lastError;
   }
   const message = messages.join('\n');
   // Phrase regexes (and the prose-shaped status forms) only see text BEFORE
@@ -331,11 +379,11 @@ export function classifyGlobalLlmError(err: unknown): GlobalLlmErrorClass | null
   const phraseText = rawIdx === -1 ? message : message.slice(0, rawIdx);
 
   if (BILLING_MESSAGE_RE.test(phraseText)) return 'billing';
+  if (MODEL_NOT_FOUND_MESSAGE_RE.test(phraseText)) return 'model_not_found';
   if (status !== undefined) {
     const byStatus = statusToClass(status);
     if (byStatus) return byStatus;
   }
-  if (MODEL_NOT_FOUND_MESSAGE_RE.test(phraseText)) return 'model_not_found';
   // Config-level errors are whole-run by construction — a missing/invalid
   // key or an unknown model id fails identically on every call. The gateway
   // throws AIConfigError directly for missing keys ("OpenAI chat requires

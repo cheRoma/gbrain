@@ -20,6 +20,7 @@ import { VERB_NAMES } from './verbs.ts';
 import { classifyPgAccessError, formatDbAccessMarker } from './pg-access-classify.ts';
 import { redactConnectionInfo } from './audit/redact-connection-info.ts';
 import { redactUrlsInText } from './url-redact.ts';
+import { parseRepoBase } from './repo-base.ts';
 import { recordAgentContractEvent } from './agent-contract-log.ts';
 import { cliRouting, pinRouting, type FixRouting } from './fix-routing.ts';
 
@@ -39,6 +40,8 @@ export interface ActionInput { name: string; how: string }
 
 /** Stored/constructed form. Never carries `next` or `command`: both are computed at render time. */
 export interface Action {
+  /** Escalation only: an action the agent must not take without asking renders `next: ask_user` whatever else it carries. */
+  ask_user?: true;
   argv?: string[];
   mcp?: McpCall;
   consent: Effect[];
@@ -55,7 +58,7 @@ export interface Action {
 }
 
 /** Wire form: what an agent reads. */
-export interface RenderedAction extends Omit<Action, 'then' | 'docs'> {
+export interface RenderedAction extends Omit<Action, 'then' | 'docs' | 'ask_user'> {
   command?: string;
   next: Next;
   docs?: string;
@@ -92,6 +95,8 @@ export interface AgentEnvelope {
   notices?: RenderedNotice[];
   contract_version: 1;
   detail?: string; protocol_version?: 1; write_request?: unknown; write_error?: string;
+  /** #6188: a fence refusal's location and blocking issues (location and class only). */
+  fence?: Record<string, unknown>; fence_issues?: Array<Record<string, unknown>>;
 }
 
 export interface RenderContext {
@@ -205,14 +210,24 @@ function docsRef(): string {
 export function docsUrl(anchor: string): string {
   if (/^https?:\/\//.test(anchor)) return anchor;
   const path = anchor.replace(/^\.?\//, '');
-  const forkBase = process.env.LLMS_REPO_BASE?.replace(/\/+$/, '');
-  return forkBase ? `${forkBase}/${path}` : `${REPO_BLOB}/${docsRef()}/${path}`;
+  const forkBase = parseRepoBase(process.env.LLMS_REPO_BASE);
+  if (forkBase !== null && typeof forkBase !== 'string') warnInvalidRepoBase(forkBase.invalid);
+  return typeof forkBase === 'string' ? `${forkBase}/${path}` : `${REPO_BLOB}/${docsRef()}/${path}`;
+}
+
+let warnedRepoBase: string | null = null;
+/** W4.12: an invalid `LLMS_REPO_BASE` is ignored (default links), with one stderr line per value. */
+function warnInvalidRepoBase(value: string): void {
+  if (warnedRepoBase === value) return;
+  warnedRepoBase = value;
+  process.stderr.write('[gbrain] LLMS_REPO_BASE is not a plain https URL, so documentation links use the default repository. Unset it or set an https base.\n');
 }
 
 // ── next + rendering ───────────────────────────────────────────────────────
 
 /** The published decision table (first matching row wins). */
 export function deriveNext(a: Action, ctx: RenderContext): Next {
+  if (a.ask_user) return 'ask_user';
   const callableMcp = a.mcp !== undefined && ctx.isCallable(a.mcp.tool);
   const mcpOnlyOnCli = ctx.transport === 'cli' && !a.argv?.length && a.mcp !== undefined && !callableMcp;
   if (!a.argv?.length && !callableMcp && !mcpOnlyOnCli) return 'report';
@@ -351,6 +366,8 @@ export interface EnvelopeParts {
   write_request?: unknown;
   write_error?: string;
   retryable?: boolean;
+  fence?: Record<string, unknown>;
+  fence_issues?: Array<Record<string, unknown>>;
 }
 
 /** Replace each occurrence of `bare` that is a whole command (not followed by a word, path or more flags). */
@@ -397,6 +414,8 @@ export function buildEnvelope(p: EnvelopeParts, ctx: RenderContext): AgentEnvelo
     ...(p.protocol_version !== undefined ? { protocol_version: p.protocol_version } : {}),
     ...(p.write_request !== undefined ? { write_request: p.write_request } : {}),
     ...(p.write_error !== undefined ? { write_error: p.write_error } : {}),
+    ...(p.fence !== undefined ? { fence: p.fence } : {}),
+    ...(p.fence_issues?.length ? { fence_issues: p.fence_issues } : {}),
     ...(p.reason !== undefined ? { reason: p.reason } : {}),
     ...(p.why !== undefined ? { why: p.why } : {}),
     ...(fix ? { fix } : {}),
@@ -538,6 +557,8 @@ const ROWS: Row[] = [
         reason: e.reason, why: e.why, fix, docs: e.docs, notices: e.notices, detail: e.detail,
         protocol_version: e.protocolVersion === 1 ? 1 : undefined,
         write_request: j.write_request, write_error: e.writeError,
+        ...(e.fence ? { fence: e.fence } : {}), ...(e.fenceIssues?.length ? { fence_issues: e.fenceIssues } : {}),
+        ...(e.retryable !== undefined ? { retryable: e.retryable } : {}),
       };
     },
   },

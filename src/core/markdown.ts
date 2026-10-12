@@ -6,6 +6,7 @@ import {
   commentValueKeys, frontmatterKeyHazard, recoverFrontmatter, unclosedFenceProtectedKey, yamlLocationMessage,
   RECOVERY_VERSION, type FrontmatterRecovery, type RecoveryKind,
 } from './frontmatter-recovery.ts';
+import { findLineOutsideFencedCode } from './fence-scan.ts';
 
 export {
   recoverFrontmatter, RECOVERY_VERSION, PROTECTED_FRONTMATTER_KEYS, IDENTITY_FRONTMATTER_KEYS,
@@ -417,11 +418,7 @@ export function parseMarkdown(
   const tags = extractTags(frontmatter);
   const slug = coerceFrontmatterString(frontmatter.slug) || inferSlug(filePath);
 
-  const cleanFrontmatter = { ...frontmatter };
-  delete cleanFrontmatter.type;
-  delete cleanFrontmatter.title;
-  delete cleanFrontmatter.tags;
-  delete cleanFrontmatter.slug;
+  const cleanFrontmatter = comparableFrontmatter(frontmatter);
 
   const result: ParsedMarkdown = {
     frontmatter: cleanFrontmatter,
@@ -648,6 +645,13 @@ function collectValidationErrors(
     });
   }
 
+  // #6157: parse the whole block once. The per-line NESTED_QUOTES heuristic
+  // below only runs when the block fails to parse; a block-scalar
+  // continuation line that looks like `Key: "a", "b"` is valid YAML. A block
+  // over the alias limit counts as not parsing (the heuristics apply).
+  const blockParseError = yamlBlockError(fmBody);
+  const blockParses = blockParseError === null && yamlAliasesWithinLimit(fmBody);
+
   // 5. NESTED_QUOTES — common breakage pattern: `title: "Name "Nick" Last"`.
   //    The heuristic: a frontmatter `key: value` line with 3+ unescaped
   //    double-quote characters is suspicious. But raw quote-counting is
@@ -657,7 +661,7 @@ function collectValidationErrors(
   //    Disambiguate by running js-yaml on just the value; only flag
   //    lines that genuinely fail to parse. The full-frontmatter YAML
   //    parse error is caught separately by check 6 (YAML_PARSE) below.
-  for (let i = firstNonEmpty + 1; i < closeLine; i++) {
+  for (let i = firstNonEmpty + 1; !blockParses && i < closeLine; i++) {
     const line = lines[i];
     const m = line.match(/^\s*[A-Za-z_][\w-]*\s*:\s*(.*)$/);
     if (!m) continue;
@@ -695,14 +699,7 @@ function collectValidationErrors(
   // body with empty data, so the validation surface must not depend only on
   // gray-matter's parse path. Gate this on frontmatter-shaped fields so a
   // leading Markdown thematic break / epigraph is preserved as body content.
-  let detectedYamlParseError = looksLikeFrontmatter ? ctx.yamlParseError : null;
-  if (!detectedYamlParseError && looksLikeFrontmatter) {
-    try {
-      yamlLoad(fmBody);
-    } catch (e) {
-      detectedYamlParseError = e as Error;
-    }
-  }
+  const detectedYamlParseError = looksLikeFrontmatter ? (ctx.yamlParseError ?? blockParseError) : null;
   if (detectedYamlParseError) {
     // #5988: location only. js-yaml's own message quotes the document, and
     // this text reaches receipts, sync results and remote callers.
@@ -746,6 +743,33 @@ function collectValidationErrors(
         message: `Frontmatter "${field}" should be a string but is ${typeof v} (${JSON.stringify(v)}); quote the value (e.g. ${field}: "${String(v)}").`,
       });
     }
+  }
+}
+
+/**
+ * Most YAML aliases (`*name`) a frontmatter block may hold before the #6157
+ * whole-block checks treat it as not parsing. Frontmatter is untrusted: a few
+ * hundred bytes of nested `&a [*b, *b]` anchors expand exponentially once the
+ * parsed value is walked (compared, stringified). Real frontmatter rarely
+ * uses aliases at all.
+ */
+export const MAX_FRONTMATTER_YAML_ALIASES = 16;
+
+/** False when the text holds more than MAX_FRONTMATTER_YAML_ALIASES aliases outside quoted strings. */
+export function yamlAliasesWithinLimit(text: string): boolean {
+  const unquoted = text.replace(/"(?:[^"\\\n]|\\.)*"|'(?:[^'\n]|'')*'/g, '');
+  let count = 0;
+  for (const _ of unquoted.matchAll(/(?:^|[\s,[{])\*[^\s,[\]{}]/g)) if (++count > MAX_FRONTMATTER_YAML_ALIASES) return false;
+  return true;
+}
+
+/** The js-yaml error for a frontmatter block, or null when the whole block parses. */
+export function yamlBlockError(block: string): Error | null {
+  try {
+    yamlLoad(block);
+    return null;
+  } catch (e) {
+    return e as Error;
   }
 }
 
@@ -826,30 +850,34 @@ export function splitBody(body: string): { compiled_truth: string; timeline: str
  * shape) so the frontmatter's `---` delimiters can't false-positive rule 3.
  */
 export function findTimelineSplitIndex(lines: string[]): number {
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
+  // A sentinel quoted inside a fenced code block (a markdown example) is not
+  // a separator. Mispaired fences (see MarkdownCodeMap) leave every candidate
+  // live, as before.
+  return findLineOutsideFencedCode(lines, (i) => isTimelineSentinelLine(lines, i));
+}
 
-    if (trimmed === '<!-- timeline -->' || trimmed === '<!--timeline-->') {
-      return i;
-    }
+function isTimelineSentinelLine(lines: string[], i: number): boolean {
+  const trimmed = lines[i].trim();
 
-    if (trimmed === '--- timeline ---' || /^---\s+timeline\s+---$/i.test(trimmed)) {
-      return i;
-    }
+  if (trimmed === '<!-- timeline -->' || trimmed === '<!--timeline-->') {
+    return true;
+  }
 
-    if (trimmed === '---') {
-      const beforeContent = lines.slice(0, i).join('\n').trim();
-      if (beforeContent.length === 0) continue;
+  if (trimmed === '--- timeline ---' || /^---\s+timeline\s+---$/i.test(trimmed)) {
+    return true;
+  }
 
-      for (let j = i + 1; j < lines.length; j++) {
-        const next = lines[j].trim();
-        if (next.length === 0) continue;
-        if (/^##\s+(timeline|history)\s*$/i.test(next)) return i;
-        break;
-      }
+  if (trimmed === '---') {
+    const beforeContent = lines.slice(0, i).join('\n').trim();
+    if (beforeContent.length === 0) return false;
+
+    for (let j = i + 1; j < lines.length; j++) {
+      const next = lines[j].trim();
+      if (next.length === 0) continue;
+      return /^##\s+(timeline|history)\s*$/i.test(next);
     }
   }
-  return -1;
+  return false;
 }
 
 /** A timeline entry line: a bullet whose text starts with a 4-digit year
@@ -1161,7 +1189,8 @@ function inferSlug(filePath?: string): string {
 function extractTags(frontmatter: Record<string, unknown>): string[] {
   const tags = frontmatter.tags;
   if (!tags) return [];
-  if (Array.isArray(tags)) return tags.map(String);
+  // Only scalar items are tags: stringifying a nested array would expand a YAML alias bomb.
+  if (Array.isArray(tags)) return tags.filter(t => t instanceof Date || (t !== null && typeof t !== 'object')).map(String);
   if (typeof tags === 'string') return tags.split(',').map(t => t.trim()).filter(Boolean);
   return [];
 }
@@ -1179,6 +1208,21 @@ import { existsSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep as pathSep } from 'node:path';
 
 /** Options for serializePageToMarkdown. */
+/**
+ * #6454: the four top-level frontmatter keys the parser lifts into page
+ * columns (`type`, `title`, `tags`, `slug`) and drops from
+ * `ParsedMarkdown.frontmatter`. A file can never carry them into the stored
+ * frontmatter, so a stored copy of one of them (older imports kept them) is
+ * not drift: every file-versus-database comparison and every render strips
+ * them first, top-level only; nested user keys are left alone.
+ */
+export const RESERVED_FRONTMATTER_KEYS = ['type', 'title', 'tags', 'slug'] as const;
+export function comparableFrontmatter(frontmatter: Record<string, unknown> | null | undefined): Record<string, unknown> {
+  const clean: Record<string, unknown> = { ...(frontmatter ?? {}) };
+  for (const key of RESERVED_FRONTMATTER_KEYS) delete clean[key];
+  return clean;
+}
+
 export interface SerializePageOpts {
   /** Frontmatter fields merged on top of page.frontmatter at render time.
    *  Use this to stamp provenance (`ingested_via: 'webhook'`), identity
@@ -1207,8 +1251,12 @@ export function serializePageToMarkdown(
   tags: string[],
   opts: SerializePageOpts = {},
 ): string {
+  // #6454: the columns are the page's type, title and tags; a stored reserved key (older imports kept
+  // them) never overrides them in the rendered file. A stored `slug` still reaches the #5966 stamp rule, which
+  // replaces one that names another identity with the page's slug.
+  const stored = page.frontmatter ?? {};
   const frontmatter: Record<string, unknown> = {
-    ...((page.frontmatter ?? {}) as Record<string, unknown>),
+    ...slugStampedFrontmatter(page.slug, { ...comparableFrontmatter(stored), ...(stored.slug !== undefined ? { slug: stored.slug } : {}) }),
     ...(opts.frontmatterOverrides ?? {}),
   };
   return serializeMarkdown(
@@ -1221,6 +1269,22 @@ export function serializePageToMarkdown(
       tags,
     },
   );
+}
+
+/**
+ * #5966 (W14 P1.7): the one slug rule every render follows. A slug the file
+ * path cannot derive (a doubled hyphen, which `slugifyPath` collapses to one) is
+ * stamped as `slug:` so every path-derived reader (sync, reconcile, repair)
+ * finds the page again; a `frontmatter.slug` naming another identity is
+ * replaced by the page slug (the export rule, #3772). The stamp is
+ * digest-neutral: `parseMarkdown` drops `frontmatter.slug`, so canonical
+ * fields compare equal with or without it.
+ */
+export function slugStampedFrontmatter(slug: string | undefined, frontmatter: Record<string, unknown>): Record<string, unknown> {
+  if (typeof slug !== 'string' || slug === '') return frontmatter;
+  const declared = frontmatter.slug;
+  if (slugifyPath(slug + '.md') !== slug || (declared !== undefined && declared !== slug)) return { ...frontmatter, slug };
+  return frontmatter;
 }
 
 /**
@@ -1286,11 +1350,26 @@ function safeSlugDirSegments(rawSlug: string | null | undefined): string[] | nul
   return segments.slice(0, -1);
 }
 
+/**
+ * The segments of `localPath` below its nearest ancestor holding `.git` (`[]`
+ * when `localPath` is that Git root), or null when no ancestor holds one. A
+ * caller resolving many pages of one source computes it once and passes it to
+ * `resolveSourceLocalFilePath` as `gitScope`.
+ */
+export function sourceGitScope(localPath: string): string[] | null {
+  const absoluteLocalPath = resolve(localPath);
+  for (let cursor = absoluteLocalPath; ; cursor = dirname(cursor)) {
+    if (existsSync(join(cursor, '.git'))) return splitLocalPathSegments(relative(cursor, absoluteLocalPath));
+    if (dirname(cursor) === cursor) return null;
+  }
+}
+
 export function resolveSourceLocalFilePath(
   localPath: string,
   rawSourcePath: string | null | undefined,
   pageSlug?: string | null,
   slugRootMode?: 'git-root' | 'source-root',
+  gitScope?: string[] | null,
 ): string | null {
   if (!rawSourcePath) return null;
   const value = rawSourcePath.trim();
@@ -1302,21 +1381,14 @@ export function resolveSourceLocalFilePath(
   const absoluteLocalPath = resolve(localPath);
   let sourceScopeSegments: string[] = [];
   let resolvedSegments = sourceSegments;
-  let cursor = absoluteLocalPath;
-  while (true) {
-    if (existsSync(join(cursor, '.git'))) {
-      const scope = splitLocalPathSegments(relative(cursor, absoluteLocalPath));
-      sourceScopeSegments = scope;
-      const scoped = scope.length > 0 && scope.every((segment, index) => segment === sourceSegments[index]);
-      if (scoped && (slugRootMode !== 'source-root'
-        || !!pageSlug && resolveSlugForPath(sourceSegments.slice(scope.length).join('/')) === pageSlug)) {
-        resolvedSegments = sourceSegments.slice(scope.length);
-      }
-      break;
+  const scope = gitScope === undefined ? sourceGitScope(localPath) : gitScope;
+  if (scope) {
+    sourceScopeSegments = scope;
+    const scoped = scope.length > 0 && scope.every((segment, index) => segment === sourceSegments[index]);
+    if (scoped && (slugRootMode !== 'source-root'
+      || !!pageSlug && resolveSlugForPath(sourceSegments.slice(scope.length).join('/')) === pageSlug)) {
+      resolvedSegments = sourceSegments.slice(scope.length);
     }
-    const parent = dirname(cursor);
-    if (parent === cursor) break;
-    cursor = parent;
   }
   const directPath = join(absoluteLocalPath, ...resolvedSegments);
   if (existsSync(directPath)) return directPath;

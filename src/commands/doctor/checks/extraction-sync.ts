@@ -12,8 +12,8 @@ import { probeSourceGitState } from '../../../core/git-head.ts';
 // this pure comparator (no git subprocess on the HTTP MCP doctor path).
 import { lagFromContentMs, loadSyncFreshnessSources, resolveStalenessCeilingSeconds } from '../../../core/source-health.ts';
 import { resolveEnvNumber, resolveHoursEnv, warnOnceForEnv } from '../../../core/env-number.ts';
-import { CHUNKER_VERSION } from '../../../core/chunkers/code.ts';
-import { LINK_EXTRACTOR_VERSION_TS } from '../../../core/link-extraction.ts';
+import { chunkerStamp } from '../../../core/chunkers/code.ts';
+import { effectiveLinkExtractorWatermark, smallBrainBacklogNote } from '../../../core/link-extraction-watermark.ts';
 import { previewMentionPass } from '../../../core/mentions/stale.ts';
 import { isUndefinedColumnError } from '../../../core/utils.ts';
 import {
@@ -23,16 +23,18 @@ import {
   findDbOnlyCollisions,
 } from '../../../core/storage-config.ts';
 import { slugifyPath, slugifyCodePath, isCodeFilePath } from '../../../core/sync.ts';
-import { resolveSourceLocalFilePath } from '../../../core/markdown.ts';
+import { resolveSourceLocalFilePath, sourceGitScope } from '../../../core/markdown.ts';
 import { scannerSlugRootMode } from '../../../core/write-through.ts';
 import { unverifiedExtractionFragment } from '../../../core/extraction-review.ts';
-import { managedPersistenceEnabled } from '../../../core/persistence/ownership.ts';
+import { quarantineFilterFragment } from '../../../core/quarantine.ts';
+import { persistenceEnabledForHealth } from '../../../core/persistence/ownership.ts';
 import { upstreamFreshness } from '../../../core/sync-upstream.ts';
 import type { Check } from '../../doctor.ts';
 import { ownedContentFreshness } from '../../../core/shared-skills/content-freshness.ts';
 import { connectorAuthorities } from '../../../core/persistence/connector-authority.ts';
 import { parseSourceConfig } from '../../../core/sources-load.ts';
 import { checkError } from '../check-fix.ts';
+import { haltReasonsWithUnknown, readRecordedHaltReasons7d, topHaltReason } from '../../../core/extract/rollup-writer.ts';
 
 /** Local aliases; the shared warn-once memo lives in core so it can't fork per module. */
 const _resolveEnvNumber = resolveEnvNumber;
@@ -109,8 +111,8 @@ export async function checkLinksExtractionLag(
   try {
     const totalRows = await engine.executeRaw<{ count: number }>(
       sourceId
-        ? `SELECT count(*)::int AS count FROM pages WHERE deleted_at IS NULL AND source_id = $1`
-        : `SELECT count(*)::int AS count FROM pages WHERE deleted_at IS NULL`,
+        ? `SELECT count(*)::int AS count FROM pages WHERE deleted_at IS NULL AND ${quarantineFilterFragment('pages')} AND source_id = $1`
+        : `SELECT count(*)::int AS count FROM pages WHERE deleted_at IS NULL AND ${quarantineFilterFragment('pages')}`,
       sourceId ? [sourceId] : [],
     );
     const total = Number(totalRows[0]?.count ?? 0);
@@ -120,13 +122,13 @@ export async function checkLinksExtractionLag(
     // Vacuous-skip tiny brains unless explicitly source-scoped. Shared floor
     // const so the sync nudge (D6/C4) skips on the exact same predicate.
     if (total < EXTRACTION_LAG_MIN_PAGES && !sourceId) {
-      return { name, status: 'ok', message: `Extraction lag not applicable (${total} pages — too few to assess)` };
+      return { name, status: 'ok', message: `Extraction lag not applicable (${total} pages — too few to assess)${await smallBrainBacklogNote(engine)}` };
     }
 
     // #5761: a page left stale only by an unresolved attendee, and not edited
     // since, is attendance-blocked: `extract --stale` cannot clear it, so it
     // is reported apart from lag. Pre-v180 brains have no marker column.
-    const versionTs = LINK_EXTRACTOR_VERSION_TS;
+    const versionTs = await effectiveLinkExtractorWatermark(engine);
     let stale: number;
     let attendanceBlocked = 0;
     try {
@@ -240,7 +242,6 @@ export async function checkUnverifiedExtractions(
  */
 export async function checkContentHashDuplicates(engine: BrainEngine): Promise<Check> {
   const name = 'content_hash_duplicates';
-  const fix = 'Fix: gbrain pages delete <bare-slug> for each pair, then gbrain pages purge-deleted --older-than 0';
   try {
     // #3946: no shape predicates — EVERY same-source duplicate-content group
     // surfaces (HAVING count(*) > 1 alone). Classification happens at render:
@@ -262,6 +263,7 @@ export async function checkContentHashDuplicates(engine: BrainEngine): Promise<C
       return { name, status: 'ok', message: 'No same-source content-hash duplicate groups' };
     }
     let pairCount = 0;
+    const pairSources = new Set<string>();
     const samples: string[] = [];
     let otherGroupCount = 0;
     const otherSamples: string[] = [];
@@ -273,6 +275,7 @@ export async function checkContentHashDuplicates(engine: BrainEngine): Promise<C
         for (const b of bare) {
           const twin = prefixed.find(p => p.endsWith('/' + b)) ?? prefixed[0];
           pairCount++;
+          pairSources.add(r.source_id);
           if (samples.length < 5) samples.push(`${b} <-> ${twin}`);
         }
       } else {
@@ -282,6 +285,12 @@ export async function checkContentHashDuplicates(engine: BrainEngine): Promise<C
     }
     const parts: string[] = [];
     if (pairCount > 0) {
+      // `gbrain delete` soft-deletes in the active source, so the command pins
+      // the pairs' source; --force because page writes are revisioned and a
+      // delete naming neither --force nor --expected-revision is refused.
+      const source = pairSources.size === 1 ? [...pairSources][0] : '<source-id>';
+      const sourceNote = pairSources.size === 1 ? '' : ` (pairs span sources ${[...pairSources].sort().join(', ')}; run it once per pair with that pair's source)`;
+      const fix = `Fix: GBRAIN_SOURCE=${source} gbrain delete <bare-slug> --force for each pair${sourceNote}.`;
       parts.push(
         `${pairCount} content-hash duplicate pair(s) detected (same content, differing slug forms — ` +
         `usually an import run from the wrong root, which drops the path prefix). ` +
@@ -440,10 +449,11 @@ export async function checkUndeclaredDbOnlyPages(engine: BrainEngine): Promise<C
       if (rows.length === 0) continue;
       let backedWithoutSourcePath: Set<string> | null = null;
       const mode = await scannerSlugRootMode(engine, src.id, src.local_path!);
+      const gitScope = sourceGitScope(src.local_path!);
       for (const { slug, source_path: sourcePath } of rows) {
         if (dbOnlyDirs.some(dir => slug.startsWith(dir))) continue;
         if (sourcePath) {
-          const filePath = resolveSourceLocalFilePath(src.local_path!, sourcePath, slug, mode);
+          const filePath = resolveSourceLocalFilePath(src.local_path!, sourcePath, slug, mode, gitScope);
           if (filePath && existsSync(filePath)) continue;
         } else {
           backedWithoutSourcePath ??= collectMarkdownSlugs(src.local_path!);
@@ -701,10 +711,10 @@ export async function computeExtractAtomsBacklogCheck(
       return { name, status: 'warn', message: 'backlog query failed (could not count eligible pages)' };
     }
 
-    const { packDeclaresPhase } = await import('../../../core/cycle.ts');
+    const { resolvePackPhaseGate } = await import('../../../core/cycle.ts');
     const { extractAtomsPhaseStaleWarning } = await import('../../../core/cycle/extract-atoms-stamp.ts');
-    let declared = false;
-    try { declared = await packDeclaresPhase(engine, 'extract_atoms'); } catch { declared = false; }
+    const gate = await resolvePackPhaseGate(engine, 'extract_atoms').catch(() => ({ declared: false, consent_required: false }));
+    const declared = gate.declared && !gate.consent_required;
 
     if (backlog === 0) {
       return {
@@ -718,7 +728,7 @@ export async function computeExtractAtomsBacklogCheck(
     // it will grow forever without a signal. WARN with the drain command.
     if (!declared && backlog > 10) {
       const backlogBySource = await countExtractAtomsBacklogBySource(engine, countExtractAtomsBacklog, opts.sourceIds);
-      const fix = buildExtractAtomsBacklogFixHint(backlogBySource);
+      const fix = gate.consent_required ? 'gbrain config set cycle.extract_atoms.enabled true' : buildExtractAtomsBacklogFixHint(backlogBySource);
       return {
         name, status: 'warn',
         message: `${backlog} pages eligible for atom extraction but the active pack does not run extract_atoms — backlog growing. Fix: ${fix}`,
@@ -1041,6 +1051,8 @@ export async function computeExtractHealthCheck(
       if (!/expected_limit_count/i.test(msg)) throw err;
       rows = await engine.executeRaw<RollupRow>(rollupQuery(false), []);
     }
+    // #5495: recorded halt reasons per kind over the same 7 days (migration v239).
+    const recordedReasons = await readRecordedHaltReasons7d(engine);
 
     if (rows.length === 0) {
       return {
@@ -1063,6 +1075,9 @@ export async function computeExtractHealthCheck(
       round_completed_count: number;
       expected_limit_count: number;
       halt_rate: number;
+      /** #5495: 7-day halts per reason, `unknown` for halts no reason was recorded for. */
+      halt_reasons: Record<string, number>;
+      top_halt_reason: string | null;
       last_updated_at: string | null;
       last_halt_age_days: number | null;
     };
@@ -1076,6 +1091,7 @@ export async function computeExtractHealthCheck(
       // not self-imposed capacity limits. A backlog-bigger-than-budget brain
       // whose every run banks progress and stops at the cap reads 0%.
       const total = halts + completed + expectedLimits;
+      const haltReasons = haltReasonsWithUnknown(halts, recordedReasons.get(r.kind) ?? {});
       return {
         kind: r.kind,
         cost_7d_usd: Number(r.cost_7d_usd) || 0,
@@ -1085,6 +1101,8 @@ export async function computeExtractHealthCheck(
         round_completed_count: completed,
         expected_limit_count: expectedLimits,
         halt_rate: total > 0 ? halts / total : 0,
+        halt_reasons: haltReasons,
+        top_halt_reason: topHaltReason(haltReasons)?.reason ?? null,
         last_updated_at: r.last_updated_at
           ? new Date(r.last_updated_at).toISOString()
           : null,
@@ -1117,7 +1135,9 @@ export async function computeExtractHealthCheck(
         .map(k => {
           const ageDays = k.last_halt_age_days;
           const ageSuffix = ageDays === null ? '' : ageDays <= 0 ? ', last halt today' : `, last halt ${ageDays}d ago`;
-          return `${k.kind}=${(k.halt_rate * 100).toFixed(1)}%${ageSuffix}`;
+          const top = topHaltReason(k.halt_reasons);
+          const reasonSuffix = top ? ` (top reason: ${top.reason} ×${top.count})` : '';
+          return `${k.kind}=${(k.halt_rate * 100).toFixed(1)}%${ageSuffix}${reasonSuffix}`;
         })
         .join(', ');
       return {
@@ -1226,8 +1246,8 @@ export async function checkSyncFreshness(
     // v0.41.27.0: D7 narrowed predicate. The CHUNKER_VERSION caller-side
     // check mirrors sync.ts:1057's chunker-version gate so doctor agrees
     // with sync on "is there work to do?". `sources.chunker_version` is
-    // a TEXT column storing String(CHUNKER_VERSION).
-    const currentChunkerVersion = String(CHUNKER_VERSION);
+    // a TEXT column storing chunkerStamp().
+    const currentChunkerVersion = chunkerStamp();
 
     const issues: string[] = [];
     let ownedContent = new Set<string>();
@@ -1284,7 +1304,7 @@ export async function checkSyncFreshness(
     // machinery runs once, not once per source).
     const stalenessCeilingSeconds = resolveStalenessCeilingSeconds();
     let managed = false;
-    try { managed = await managedPersistenceEnabled(engine); } catch { /* pre-persistence brain */ }
+    try { managed = await persistenceEnabledForHealth(engine); } catch { /* pre-persistence brain */ }
     let upstream_unknown_count = 0;
     let upstream_behind_count = 0;
     for (const source of sources) {
@@ -1455,7 +1475,7 @@ export async function checkSyncFreshness(
       return {
         name: 'sync_freshness',
         status: 'fail',
-        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>\` for each stale source${inProgressNote}`,
+        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>${managed ? ' --no-pull' : ''}\` for each stale source${inProgressNote}`,
         details,
       };
     }
@@ -1463,7 +1483,7 @@ export async function checkSyncFreshness(
       return {
         name: 'sync_freshness',
         status: 'warn',
-        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>\` to refresh${inProgressNote}`,
+        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>${managed ? ' --no-pull' : ''}\` to refresh${inProgressNote}`,
         details,
       };
     }

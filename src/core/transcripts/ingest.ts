@@ -28,7 +28,11 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import { randomUUID } from 'node:crypto';
 import { importFromContent } from '../import-file.ts';
+import type { OperationContext } from '../ops/contract.ts';
+import { managedPersistenceEnabled } from '../persistence/ownership.ts';
+import { submitPageMutation } from '../persistence/page-mutations.ts';
 import { canonicalJson } from '../remediation-step.ts';
 import type { FileDiagnostics, TranscriptAdapter, TranscriptFormat } from './types.ts';
 import { detectAdapter } from './detect.ts';
@@ -70,6 +74,12 @@ export interface TranscriptsIngestOpts {
    */
   maxBytes?: number;
   activePack?: IngestActivePack;
+  /**
+   * The CLI's trusted-local operation context. On a writer-claimed brain each
+   * rendered part is submitted as a `put_page` write request through it; the
+   * direct importer is refused there. Without it the direct importer runs.
+   */
+  context?: OperationContext;
   /** Test seam for the redaction user-pattern file. */
   userPatternsPath?: string;
   /** Adapter registry override (tests). */
@@ -190,6 +200,7 @@ export async function runTranscriptsIngest(
   // recompiles the pattern file on every call, which a bulk import would
   // otherwise repeat thousands of times.
   const redactionPatterns = loadImportRedactionPatterns(opts.userPatternsPath);
+  const coordinator = !opts.dryRun && opts.context && await managedPersistenceEnabled(engine) ? opts.context : null;
 
   const total = opts.paths.length;
   let done = 0;
@@ -311,14 +322,15 @@ export async function runTranscriptsIngest(
             for (const part of rendered.parts) {
               try {
                 await preserveForeignFrontmatter(engine, opts.sourceId ?? 'default', part);
-                const r = await importFromContent(engine, part.slug, part.content, {
-                  noEmbed: !opts.embed,
-                  sourceId: opts.sourceId,
-                  activePack: opts.activePack,
-                  source_kind: `transcript:${session.meta.harness}`,
-                  source_uri: path,
-                  ingested_via: 'cli:transcripts-ingest',
-                });
+                const provenance = { source_kind: `transcript:${session.meta.harness}`, source_uri: path, ingested_via: 'cli:transcripts-ingest' };
+                const r = coordinator
+                  ? await submitTranscriptPart(coordinator, engine, opts.sourceId, part, provenance)
+                  : await importFromContent(engine, part.slug, part.content, {
+                    noEmbed: !opts.embed,
+                    sourceId: opts.sourceId,
+                    activePack: opts.activePack,
+                    ...provenance,
+                  });
                 outcome.statuses.push(r.status);
                 if (r.status === 'imported') result.pages.imported++;
                 else if (r.status === 'skipped') result.pages.skipped++;
@@ -420,7 +432,10 @@ export async function runTranscriptsIngest(
               const m = /^-p(\d+)$/.exec(suffix);
               const num = m ? Number(m[1]) : NaN;
               if (Number.isFinite(num) && num > rendered.parts.length) {
-                await engine.deletePage(row.slug, { sourceId: opts.sourceId });
+                // #5235: on a managed brain the stale part goes through the coordinator like the parts
+                // themselves, bound to its revision; the direct delete is refused there.
+                if (coordinator) await deleteStaleTranscriptPart(coordinator, engine, opts.sourceId, row.slug);
+                else await engine.deletePage(row.slug, { sourceId: opts.sourceId });
                 result.partsDeleted++;
               }
             }
@@ -451,6 +466,41 @@ export async function runTranscriptsIngest(
 
   if (opts.dryRun) result.cleanScan = false; // dry-runs never advance watermarks
   return result;
+}
+
+/**
+ * A writer-claimed brain refuses the direct importer, so a rendered part is
+ * submitted as a `put_page` write request: the same importer runs behind the
+ * coordinator, naming the current revision so a replacement is never a blind
+ * overwrite (no revision means create-only). Embedding is deferred there, as
+ * for every coordinated page write.
+ */
+async function submitTranscriptPart(
+  ctx: OperationContext,
+  engine: BrainEngine,
+  sourceId: string,
+  part: RenderedPart,
+  provenance: { source_kind: string; source_uri: string; ingested_via: string },
+): Promise<{ slug: string; status: 'imported' | 'skipped' | 'error' }> {
+  const snapshot = await engine.readPageSnapshot(part.slug, { sourceId, includeDeleted: true });
+  const receipt = await submitPageMutation(ctx, {
+    operation: 'put_page',
+    params: { slug: part.slug, content: part.content, source_id: sourceId, ...provenance,
+      ...(snapshot?.revision ? { expected_revision: snapshot.revision } : {}) },
+  });
+  const slug = typeof receipt.slug === 'string' && receipt.slug ? receipt.slug : part.slug;
+  if (receipt.state !== 'committed') return { slug, status: 'error' };
+  return { slug, status: receipt.noop === true || receipt.status === 'skipped' ? 'skipped' : 'imported' };
+}
+
+/** A stale higher-numbered part on a managed brain: a revision-bound `delete_page` write request (soft delete, recoverable). */
+async function deleteStaleTranscriptPart(ctx: OperationContext, engine: BrainEngine, sourceId: string, slug: string): Promise<void> {
+  const snapshot = await engine.readPageSnapshot(slug, { sourceId });
+  if (!snapshot) return;
+  const receipt = await submitPageMutation(ctx, { operation: 'delete_page', params: { slug, source_id: sourceId, expected_revision: snapshot.revision, request_id: randomUUID() } });
+  if (receipt.state !== 'committed') {
+    throw new Error(`stale part ${slug} was not deleted: the coordinator returned ${String(receipt.state)}${receipt.error_code ? ` (${String(receipt.error_code)})` : ''}`);
+  }
 }
 
 /**

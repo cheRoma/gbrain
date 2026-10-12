@@ -10,8 +10,8 @@
  *   - P0-5: each per-source cycle writes `last_full_cycle_at` in its
  *     `sources.config` JSONB on success (handled in `runCycle` exit hook,
  *     not here — this module just READS it for freshness gating).
- *   - P1-2: explicitly threads `pull: !!source.config.remote_url` so
- *     local-only sources don't try to git-pull.
+ *   - P1-2: automatic pull needs a remote and an unmanaged source
+ *     (`automaticSyncPull`), so local-only and managed sources never git-pull.
  *   - P1-3: PGLite engines default `fanoutMax=1` (PGLite is single-writer;
  *     parallel fan-out would queue uselessly behind the file lock).
  *   - P1-4: enumeration keeps sources with a `local_path`, so pure-DB
@@ -42,9 +42,9 @@ import { SOURCE_FRESHNESS_PHASES, MAINTENANCE_PHASES, LAST_GLOBAL_AT_KEY } from 
 import { CONNECTOR_SOURCE_PHASES } from '../core/cycle/phase-scope.ts';
 import { isConnectorSourceKind } from '../core/persistence/connector-identity.ts';
 import { attemptedConnectorSourceIds } from '../core/persistence/connector-state.ts';
-import { parseSourceConfig, sourceConfigHasRemoteUrl, sourceLocalPathSkipWarning } from '../core/sources-load.ts';
-import { isSyncDisabledConfig } from '../core/sync-policy.ts';
-import { loadActivationPendingSourceIds, skipActivationPendingSync } from '../core/sync-policy.ts';
+import { parseSourceConfig, sourceLocalPathSkipWarning } from '../core/sources-load.ts';
+import { automaticSyncPull } from '../core/persistence/automatic-sync-policy.ts';
+import { automaticSyncSkip, loadActivationPendingSourceIds, reportAutomaticSyncSkip } from '../core/sync-policy.ts';
 import { AUTOPILOT_FULL_CYCLE_FLOOR_MINUTES } from './autopilot-remediation-policy.ts';
 
 // #2194 fix #2: failure cooldown. A source whose autopilot-cycle keeps
@@ -574,13 +574,13 @@ export async function dispatchPerSource(
       // stamp; only the sync phase (and the pull that feeds it) is dropped —
       // normalizeQueuedSourcePhases passes a freshness subset through as-is.
       // #5198: a claimed source awaiting activation is treated the same way,
-      // so its cycle does not fail on a sync that is refused by contract.
-      const pendingActivation = skipActivationPendingSync(
-        activationPending, src.id, 'fanout_sync_skipped', opts.jsonMode === true, opts.jsonMode ? emit : log,
-      );
-      const syncDisabled = isSyncDisabledConfig(src.config) || pendingActivation;
+      // so its cycle does not fail on a sync that is refused by contract, and
+      // so is a gbrain-owned content directory where sync does not apply (P4.2).
+      const skip = await automaticSyncSkip(engine, src, activationPending);
+      if (skip?.reason !== 'sync_disabled') reportAutomaticSyncSkip(src.id, skip, 'fanout_sync_skipped', opts.jsonMode === true, opts.jsonMode ? emit : log);
+      const syncDisabled = !!skip;
       const connector = connectorIds.has(src.id);
-      const shouldPull = sourceConfigHasRemoteUrl(src.config) && !syncDisabled && !connector;
+      const shouldPull = !syncDisabled && !connector && await automaticSyncPull(engine, src);
       const job = await queue.add(
         'autopilot-cycle',
         {

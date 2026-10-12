@@ -234,14 +234,24 @@ explicitly on Jev, it needs `decide.egress.private allow`.
 
 ### claim support (`grounding`)
 
-After the mechanical checks in dream synthesis, each new claim that passes
-only because it has no quote, number or attribution is checked against up
-to three source windows: "is this claim supported by these sources?". An
-unsupported claim goes to the existing quarantine lane as
-`unsupported_paraphrase`; weak source coverage records
-`insufficient_context` instead. It only adds a check and can never admit a
-claim the mechanical checks rejected. On Jev it needs
-`decide.egress.private allow`.
+When this optional slot is on, every substantive new prose claim that passes
+Dream's mechanical checks is checked against up to three source excerpts:
+"is this claim supported by these sources?". A valid quote, number or speaker
+name does not prove the interpretation around it. Quote repairs happen before
+this check, so quarantine removes the repaired claim from the published body.
+
+An unsupported claim with adequate source coverage goes to the existing
+quarantine lane as `unsupported_paraphrase`. Coverage uses the distinct content
+words in the selected excerpts together, with the existing 25% floor (or a
+normalized substring hit); evidence omitted from those excerpts does not count.
+Weak coverage records `insufficient_context` and keeps the mechanical result.
+The check can never admit a claim the mechanical checks rejected. On Jev it
+needs `decide.egress.private allow`.
+
+This broader coverage can require more decision calls. The existing page/phase
+deadlines and budget limits still apply; behavior when off, on timeout or on a
+provider error is unchanged. Passing mechanical checks alone is not proof of full
+factual support, and enabling this slot does not guarantee the judge is correct.
 
 ### contradiction (`conflict`)
 
@@ -458,8 +468,11 @@ evidence       on (inactive: model_drift)
 plus a `requested: ... / effective: ... / cause: ... / fix: ...` line naming
 the one command that fixes it. A new GBrain release never silently moves an
 enabled slot to a newer reference calibration; `status` shows `newer
-reference available` and you adopt it with
-`gbrain decide calibrations adopt <id>`.
+reference available: ref:<id>` only when a shipped reference exists for the
+same slot, call site, provider and model as the calibration in use, and you
+adopt it with the command it prints, `gbrain decide calibrations adopt
+ref:<id>` (`adopt local:<id>` or `adopt <id>` picks one you built with
+`calibrate`).
 
 ## Fail directions
 
@@ -666,6 +679,7 @@ cause, a fix command and a link to a row here.
 | <a id="egress_fallback_missing"></a>`egress_fallback_missing` | Items egress refused have no fallback provider. | `gbrain config set decide.egress_fallback llm:<provider:model>`, or accept the fail direction for them. |
 | <a id="split_mismatch"></a>`split_mismatch` | The calibration was built from a different dataset split, or not from the calibrate half only. | `gbrain decide calibrate --slot <slot> --dataset <jsonl>` on the same dataset file. |
 | <a id="pinned_model_unavailable"></a>`pinned_model_unavailable` | The provider no longer serves the pinned model. Calls take the fail direction. | `gbrain config set decide.provider typesafe:<new-id> && gbrain decide calibrations list`, then recalibrate or adopt a reference calibration for the new id. |
+| <a id="unpriced_model"></a>`unpriced_model` | The configured `typesafe:<model>` id has no shipped tariff and no operator price, so its spend cannot be metered against `decide.budget.daily_usd`. Nothing was sent. | Register the price the endpoint bills: `gbrain pricing set typesafe:<model> --rate <usd-per-1M-input-tokens> --source <pricing-page-url>`, then `gbrain decide probe`. |
 | <a id="budget_exhausted"></a>`budget_exhausted` | Today's third-party decide spend reached `decide.budget.daily_usd`. Slots take their fail direction until UTC midnight. | Wait, or `gbrain config set decide.budget.daily_usd <usd>`. |
 | <a id="thin_client"></a>`thin_client` | This install is a thin client; `gbrain decide` runs on the brain host. | Run `gbrain decide` on the brain host. |
 | <a id="malformed_response"></a>`malformed_response` | The response missed a question or carried an invalid value. The decision took its fail direction. | `gbrain decide probe`; if it persists, check TypeSafe's status. |
@@ -677,7 +691,7 @@ cause, a fix command and a link to a row here.
 Receipt skip reasons (`error_reason` on skipped or error rows) also include
 `egress`, `late`, `timeout`, `rate_limited`, `provider_error`, `mixed_model`,
 `no_embedding`, `no_entity`, `missing_provenance`, `denied_source`,
-`payload_too_large`, `cache_hit` and `no_candidates`.
+`payload_too_large`, `unpriced_model`, `cache_hit` and `no_candidates`.
 
 ## Advanced diagnostics
 

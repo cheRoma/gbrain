@@ -37,7 +37,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { configureGateway } from '../src/core/ai/gateway.ts';
+import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 
 const DIM = 1536;
 
@@ -50,19 +50,21 @@ const INTERFACE_METHODS: readonly string[] = [
   // Lifecycle
   'connect', 'disconnect', 'reconnect', 'initSchema', 'transaction', 'transactionDirect', 'registerBeforeDisconnect', 'withReservedConnection',
   // Pages CRUD
-  'getPage', 'readPageSnapshot', 'lockPageKeys', 'putPage', 'findDuplicatePage', 'deletePage', 'deletePages', 'resolveSlugsByPaths',
+  'getPage', 'readPageSnapshot', 'readPageSnapshotsBatch', 'lockPageKeys', 'putPage', 'findDuplicatePage', 'findDuplicatePages', 'deletePage', 'deletePages', 'resolveSlugsByPaths',
   'softDeletePage', 'softDeletePages', 'restorePage', 'purgeDeletedPages', 'listPages', 'resolveSlugs', 'getAllSlugs',
   'listAllPageRefs', 'listAllSources', 'updateSourceConfig', 'listPrefixSampledPages', 'listCorpusSample',
   // Search
-  'searchKeyword', 'searchTitles', 'searchVector', 'getEmbeddingsByChunkIds',
+  'searchKeyword', 'countKeywordPages', 'searchKeywordPages', 'searchTitles', 'searchVector', 'getEmbeddingsByChunkIds',
   // Chunks
   'upsertChunks', 'getChunks', 'getChunkWindows', 'countStaleChunks', 'sumStaleChunkChars', 'setPageEmbeddingSignature',
   'invalidateStaleSignatureEmbeddings', 'invalidateContentDriftEmbeddings', 'listStaleChunks',
   'countChunklessPagesWithContent', 'listChunklessPagesWithContent', 'deleteChunks',
   // Extraction watermark
   'countStalePagesForExtraction', 'listStalePagesForExtraction', 'markPagesExtractedBatch', 'markPagesAttendanceBlocked',
+  // #6454 stale reserved frontmatter keys
+  'countStaleFrontmatterKeyPages', 'listStaleFrontmatterKeyPages', 'stripStaleFrontmatterKeys',
   // Links + graph
-  'addLink', 'addLinksBatch', 'replaceDerivedLinks', 'removeLink', 'getLinks', 'getBacklinks', 'listLinkSources',
+  'addLink', 'addLinksBatch', 'replaceDerivedLinks', 'replaceDerivedLinksBatch', 'removeLink', 'getLinks', 'getBacklinks', 'listLinkSources',
   'findByTitleFuzzy', 'traverseGraph', 'traversePaths', 'traversePathsDetailed', 'relationalFanout', 'relationalChainHop', 'getBacklinkCounts',
   'getAdjacencyBoosts', 'getContentFlagsByPageIds', 'getUnverifiedExtractionPageIds',
   'getPageTimestamps', 'getEffectiveDates', 'getSalienceScores', 'findOrphanPages',
@@ -356,6 +358,7 @@ describe('uncovered-method smokes (seeded PGLite)', () => {
 
   afterAll(async () => {
     await engine.disconnect();
+    resetGateway(); // R5: restore the preload baseline for later files in this shard
   });
 
   test('kind discriminator (readonly instance property, not on the prototype)', () => {
