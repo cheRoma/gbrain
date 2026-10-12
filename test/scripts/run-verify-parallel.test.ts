@@ -400,7 +400,9 @@ exit 0
     const verifyStart = testYml.indexOf("\n  verify:\n");
     const verifyJob = testYml.slice(verifyStart, testYml.indexOf("\n  serial-tests:\n", verifyStart));
     expect(verifyJob).toContain("- run: bun run verify");
-    expect(verifyJob).toMatch(/runs-on: ubicloud-standard-\d+-ubuntu/);
+    // FORK DELTA: this fork has no Ubicloud runners; its verify job runs on the
+    // GitHub-hosted Linux label instead. Either way it must stay on Linux.
+    expect(verifyJob).toMatch(/runs-on: (ubicloud-standard-\d+-ubuntu|ubuntu-24\.04$)/m);
     const dry = spawnSync("bash", [SCRIPT, "--dry-list"], { encoding: "utf8" }).stdout.split("\n");
     expect(dry).toContain("typecheck");
     const pkgScripts = (JSON.parse(readFileSync("package.json", "utf8")) as { scripts: Record<string, string> }).scripts;
