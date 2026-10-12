@@ -25,6 +25,8 @@ const EXEMPT: Record<string, string> = {
   'src/core/cycle/dream-provenance.ts': 'stamps provenance frontmatter; no new text',
   'src/core/cycle/drift.ts': 'adjusts take weights from evidence drift; no new text',
   'src/core/cycle/extract-atoms-page-state.ts': 'atom scan bookkeeping; no content',
+  // FORK DELTA (link_chat branch).
+  'src/core/cycle/link-chat.ts': 'creates a fixed-template project hub stub (gbrain-generated title and body) and a hub→chat link; no new claim text',
   'src/core/cycle/grade-takes.ts': 'writes resolution fields on existing takes; no new claim text',
   'src/core/cycle/phantom-redirect.ts': 'slug redirect (placement only)',
   'src/core/embed-facts.ts': 'embedding columns only',
