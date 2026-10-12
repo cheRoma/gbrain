@@ -2666,7 +2666,7 @@
               "counts": {
                 "global": 15,
                 "mixed": 2,
-                "source": 12
+                "source": 13
               },
               "phase_scope_map": {
                 "backlinks": "source",
@@ -2685,6 +2685,7 @@
                 "facts_drain": "global",
                 "fence_repair": "global",
                 "grade_takes": "global",
+                "link_chat": "source",
                 "lint": "source",
                 "orphans": "global",
                 "patterns": "mixed",
@@ -2700,7 +2701,7 @@
                 "synthesize_concepts": "global"
               }
             },
-            "message": "Phase taxonomy: 12 source-scoped, 15 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, schema-suggest]. Brain-global: [fence_repair, content_repair, resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, edge_contradictions, drift, standing_questions, chronicle, facts_drain, skillopt, embed, orphans, purge]. Mixed: [synthesize, patterns].",
+            "message": "Phase taxonomy: 13 source-scoped, 15 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, link_chat, schema-suggest]. Brain-global: [fence_repair, content_repair, resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, edge_contradictions, drift, standing_questions, chronicle, facts_drain, skillopt, embed, orphans, purge]. Mixed: [synthesize, patterns].",
             "name": "cycle_phase_scope",
             "status": "ok"
           },
@@ -5721,7 +5722,7 @@
               "counts": {
                 "global": 15,
                 "mixed": 2,
-                "source": 12
+                "source": 13
               },
               "phase_scope_map": {
                 "backlinks": "source",
@@ -5740,6 +5741,7 @@
                 "facts_drain": "global",
                 "fence_repair": "global",
                 "grade_takes": "global",
+                "link_chat": "source",
                 "lint": "source",
                 "orphans": "global",
                 "patterns": "mixed",
@@ -5755,7 +5757,7 @@
                 "synthesize_concepts": "global"
               }
             },
-            "message": "Phase taxonomy: 12 source-scoped, 15 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, schema-suggest]. Brain-global: [fence_repair, content_repair, resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, edge_contradictions, drift, standing_questions, chronicle, facts_drain, skillopt, embed, orphans, purge]. Mixed: [synthesize, patterns].",
+            "message": "Phase taxonomy: 13 source-scoped, 15 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, link_chat, schema-suggest]. Brain-global: [fence_repair, content_repair, resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, edge_contradictions, drift, standing_questions, chronicle, facts_drain, skillopt, embed, orphans, purge]. Mixed: [synthesize, patterns].",
             "name": "cycle_phase_scope",
             "status": "ok"
           },

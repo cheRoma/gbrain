@@ -299,6 +299,7 @@ timeline extraction run as tiered derivers since #5575 (I2). A new writer
 that cannot be attributed yet is declared here:
 
 <!-- write-attribution-unattributed:start -->
+- `src/core/cycle/link-chat.ts` (1): fork delta (link_chat branch). The `link_chat` phase creates a missing project hub page with a plain `putPage` on unmanaged brains; managed brains publish the hub as a request.
 <!-- write-attribution-unattributed:end -->
 
 ## The privacy boundary

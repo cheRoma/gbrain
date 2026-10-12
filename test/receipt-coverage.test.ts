@@ -52,6 +52,8 @@ const RECEIPT_COVERAGE: Record<string, Coverage> = {
   'src/core/persistence/connector-path.ts': { sites: 1, tables: ['sources'], other: 'clears an unbound connector source local_path (source registration, not knowledge)' },
   'src/core/persistence/connector-sync.ts': { sites: 1, tables: ['sources'], other: 'the connector lease freshness stamp on its own source row' },
   'src/core/persistence/sync-run.ts': { sites: 1, tables: ['sources'], other: 'the managed sync freshness heartbeat on its own source row' },
+  // FORK DELTA (link_chat branch): the hub→chat edge commits in withCoordinatedWrite on managed brains.
+  'src/core/cycle/link-chat.ts': { sites: 1, tables: [], other: 'the link_chat hub→chat session edge (links is not a guarded table)' },
 };
 
 /** Facts/takes writers allowed without a receipt this wave, each with its TODO above. */
