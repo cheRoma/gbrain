@@ -68,15 +68,74 @@ block. Remote callers get **lean rows** by default: the fields an agent acts
 on, without the ranking diagnostics that would make each row several times
 longer than its evidence text.
 
-A lean row keeps `id` (the `fetch` key), `slug`, `title`, `type`,
-`chunk_text`, `score`, `effective_date`, `source_id`, `chunk_id` (with
-`slug` and `source_id`, the `assemble_evidence` hit), `evidence` and
-`create_safety` (the duplicate-page guard). It also keeps every safety or
+A lean row keeps `slug`, `title`, `type`, `chunk_text`, `score` (4
+significant digits), `effective_date`, `source_id`, `chunk_id` (with `slug`
+and `source_id`, the `assemble_evidence` hit), `evidence`, `create_safety`
+(the duplicate-page guard), `trust_tier` and `origin`. It keeps `id` (the
+`fetch` key) only when this connection can call `fetch` at that moment: a
+`full` surface, a stdio session `request_tools` widened, or an HTTP client
+whose surface and scopes include it (`starter` and `verbs` do not list
+`fetch`). After `fetch` becomes callable, re-run `search` for `id` or pass
+the row's `slug` to `fetch` (accepted when unambiguous); `fields: "full"`
+returns every field. It also keeps every safety or
 provenance marker that is present: `injection_suspected`, `injection_p`,
 `unverified`, `content_flag`, `status`, `superseded`, `superseded_by`,
 `message_id`, `thread_id`, `source_subject`, `modality` when not `text`,
 `stale` when true, `provenance: "generated"` on a machine-written page,
 and `delivered: {"truncated": true}` when evidence delivery cut the text.
+
+A row of third-party text carries `quoted: "transcript"`, and its
+`chunk_text` is a quoted excerpt: a line naming the page as source
+material, not instructions, then the text inside a code fence it cannot
+close. Third-party text is a page whose type holds someone else's words
+(`conversation`, `meeting`, `slack`, `slack-dm-day`, `slack-thread`,
+`email`, `email-digest`, `imessage`, `imessage-daily`, `transcript`, `chat`)
+or a fact taken from one, marker `fact <id>`: saved by the conversation-facts
+extractor (provenance `cli:extract-conversation-facts`), or recorded as
+derived from or held on such a page (the facts backstop on a synced Slack,
+email or meeting page, `extract_facts`; for older backstop facts, the page
+its `source_session` names). If that lookup fails, `saved_facts` is left out
+(degraded stage `saved_facts_withheld`) and remote `recall` returns no facts
+(`facts_degraded.reason: "saved_facts_withheld"`), never unquoted facts. Each tool-call or function-call JSON block in it (Gemini
+`functionCall` included) is replaced by
+`[tool call: <name>, arguments omitted]`, and so is each XML-style call
+block (`function_calls`, `invoke`, `tool_use`, `tool_call`). `search`, `query` and
+`assemble_evidence` return it this way to every caller, the CLI included
+(their `saved_facts` too); the stored page is unchanged.
+
+Over MCP (any caller that is not the trusted local CLI) the other reads
+quote the same text (#8042). `recall` quotes its `results` and each quoted
+fact's `fact` (with `quoted`), and so do `delta` facts, `context_pack` and
+`_meta.brain_hot_memory`. `get_page` on such a page returns
+`quoted: "transcript"` with `compiled_truth`, `timeline`, `content` and
+every window's text each fenced. Its reading shapes (`compiled_truth`,
+`timeline`, `view: read` windows) and `fetch`'s `text` also have a
+conversation page's tool-call blocks summarized, as search does. `include_content`
+and `view: markdown` keep the stored text byte-exact inside the fence, so
+`edit_page` `old_text` copied from inside a fence still matches, and
+`put_page` given that `content` back removes exactly the fences get_page
+added around this page before writing (a fence-like text in an owner-tier
+note's stored body is kept). A remote `put_page` whose content holds a
+tool-call summary that a whole read of the stored page never produces, or
+that keeps fewer of a summarized call than the stored page holds, is
+refused with `invalid_params` and stores nothing. `get_page` with
+`known_as_of` and `get_versions` with `include_body` (and its `diff`) fence
+the recorded bodies of these pages the same way. `fetch` quotes `text` the
+same way (`metadata.quoted`). `search_exact` and `get_chunks` quote their
+text too and summarize tool calls on conversation pages; `get_timeline`
+quotes its entries. The
+trusted local CLI (`gbrain get`, `gbrain put`) reads and writes the body as
+stored.
+
+Over MCP, text is also quoted by its stored trust tier: anything below "your
+notes" (written by an agent, tool data, external, or unverified origin) comes
+back quoted on search, `query`, `recall`, `assemble_evidence`, `get_page`,
+`fetch`, `get_timeline`, `get_chunks`, `search_exact`, `get_versions`, `known_as_of`,
+`think`'s extractive answer, hot memory and write receipts. A note saved before
+gbrain tracked trust reads as unverified, so it is quoted until the owner runs
+`gbrain trust claim-sources` or `gbrain trust backfill` (`gbrain doctor` names how
+many pages that is). `chronicle_*`, takes reads and page titles are not quoted
+yet. Local reads are unchanged.
 
 `effective_date` is the page's own date and `effective_date_source` says
 which kind: `date`, `published` or `filename` is a document date,
@@ -133,4 +192,19 @@ pass it to `get_page`.
 {"result_type":"fact","fact_id":"412","page_slug":"companies/acme-example","follow_up":{"op":"recall","args":{"entity":"companies/acme-example"}},"title":"Saved fact about companies/acme-example","chunk_text":"Saved fact (fact; valid from 2026-09-01; provenance: user update): The billing contact for Acme Example is Bob.","score":0.42,"source_id":"default"}
 ```
 
-`search.query_facts_arm=false` turns fact rows off.
+`search.query_facts_arm=false` turns these rows off. A `query` with a token
+budget instead gets the facts block (on by default): up to 40 dated fact rows,
+oldest first, ahead of the pages and within 22% of the budget, in place of the
+facts arm. `search.query_facts_block=false` restores the arm.
+
+## Recent facts in `_meta.brain_hot_memory`
+
+Most successful tool calls carry `_meta.brain_hot_memory`: up to 10 recent
+facts from the connection's own source. For a token, that is its write source,
+the first id of its source grant. For a member token whose first source is the
+member's private source, the block holds that member's own facts. A harness
+that answers a channel or other shared session should send
+`_meta.hot_memory: "off"` with each call, on the request beside `arguments`
+or inside the arguments, so those facts can't ride into a reply other people
+read. Without it, the block is unchanged. When it appears and which facts it
+holds: [MCP_META_CHANNELS.md](../protocol/MCP_META_CHANNELS.md#brain_hot_memory-when-it-appears-and-how-to-turn-it-off).

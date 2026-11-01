@@ -23,6 +23,7 @@ import { importFromContent } from '../src/core/import-file.ts';
 import { serializeMarkdown } from '../src/core/markdown.ts';
 import { dispatchToolCall, type ToolResult } from '../src/mcp/dispatch.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { asOwner } from './helpers/owner-tier.ts';
 
 /**
  * ceil(measured x 1.05) on the fixture below. search 2540 -> 2754 (2622
@@ -35,9 +36,12 @@ import { withEnv } from './helpers/with-env.ts';
  * ceilings 2540 -> 2756): search 3129 -> 3408 (3245 measured), query
  * 2916 -> 3195 (3042). Master merge (19358c1d9 re-pinned master's query
  * ceiling to 3303 for per-row fact trust tiers): query 3195 -> 3669 (3494
- * measured); search unchanged (3245).
+ * measured); search unchanged (3245). GBRA-81 item 2 (lean-row score at 4
+ * significant digits; the fixture is now a full-surface HTTP client with a
+ * read grant, so `id` stays): search 3408 -> 3356 (3196 measured), query
+ * 3669 -> 3593 (3421).
  */
-const CEILINGS = { search: 3408, query: 3669 };
+const CEILINGS = { search: 3356, query: 3593 };
 /**
  * The keyless fixture also gets the operator contract's degraded_recall
  * notice (F3) on every HTTP call. It is bounded on its own so the ceilings
@@ -55,25 +59,30 @@ const PAGES: Array<[string, string, string]> = [
   ['notes/billing-faq', 'Billing FAQ', 'Billing contacts change often. Confirm the current billing contact before sending an invoice or a renewal quote.'],
 ];
 
+/** A full-surface HTTP client with a read grant (the registration default): `fetch` is callable, so lean rows keep `id`. */
+const HTTP_CLIENT = { remote: true, transport: 'http' as const, sourceId: 'default', auth: { token: 't', clientId: 'size-client', clientName: 'size', scopes: ['read'], expiresAt: Date.now() / 1000 + 3600 } };
+
 let engine: PGLiteEngine;
 
 beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
-  for (const [slug, title, body] of PAGES) {
-    await importFromContent(engine, slug, serializeMarkdown({}, body, '', { type: 'note', title, tags: [] }), { noEmbed: true, forceRechunk: true });
-  }
-  await engine.executeRaw(`INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, source, valid_from) VALUES
-    ('default', 'numbat-labs', 'The billing contact for Numbat Labs is New Person.', 'fact', 'world', 'user update', '2026-09-01'),
-    ('default', 'numbat-labs', 'Numbat Labs renewal quote goes to the billing contact.', 'fact', 'world', 'user update', '2026-09-02')`);
+  await asOwner(engine, async tx => {
+    for (const [slug, title, body] of PAGES) {
+      await importFromContent(tx, slug, serializeMarkdown({}, body, '', { type: 'note', title, tags: [] }), { noEmbed: true, forceRechunk: true });
+    }
+    await tx.executeRaw(`INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, source, valid_from) VALUES
+      ('default', 'numbat-labs', 'The billing contact for Numbat Labs is New Person.', 'fact', 'world', 'user update', '2026-09-01'),
+      ('default', 'numbat-labs', 'Numbat Labs renewal quote goes to the billing contact.', 'fact', 'world', 'user update', '2026-09-02')`);
+  });
 }, 120_000);
 
 afterAll(async () => { await engine?.disconnect(); });
 
 async function visible(name: 'search' | 'query'): Promise<{ res: ToolResult; text: string }> {
   const args = name === 'query' ? { query: 'Numbat Labs billing contact renewal', expand: false } : { query: 'Numbat Labs billing contact renewal' };
-  const res = await withEnv({ GBRAIN_BACKUP_CHECK: '0' }, () => dispatchToolCall(engine, name, args, { remote: true, transport: 'http', sourceId: 'default' }));
+  const res = await withEnv({ GBRAIN_BACKUP_CHECK: '0' }, () => dispatchToolCall(engine, name, args, HTTP_CLIENT));
   expect(res.isError).not.toBe(true);
   const degraded = res.content.filter(c => isDegradedNotice(c.text));
   expect(degraded.length).toBe(1);
@@ -109,7 +118,7 @@ describe('canonical remote result size', () => {
       expect(JSON.stringify(body, null, 2).length + rest).toBeGreaterThan(CEILINGS[name]);
       const full = await withEnv({ GBRAIN_BACKUP_CHECK: '0' }, () => dispatchToolCall(engine, name,
         { query: 'Numbat Labs billing contact renewal', ...(name === 'query' ? { expand: false } : {}), fields: 'full' },
-        { remote: true, transport: 'http', sourceId: 'default' }));
+        HTTP_CLIENT));
       expect(full.content.filter(c => !isDegradedNotice(c.text)).map(c => c.text).join('\n').length).toBeGreaterThan(CEILINGS[name]);
     });
   }

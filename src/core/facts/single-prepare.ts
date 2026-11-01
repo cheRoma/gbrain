@@ -1,5 +1,5 @@
 import type { BrainEngine, FactAttribution, FactRow } from '../engine.ts';
-import { verbError } from '../ops/contract.ts';
+import { verbError, type OperationError } from '../ops/contract.ts';
 import { isAvailable, embedOne, getEmbeddingModel } from '../ai/gateway.ts';
 import { cosineSimilarity } from './classify.ts';
 import { FACT_WITHDRAWN_MESSAGE, FACT_WITHDRAWN_SUGGESTION, isFactWithdrawn } from './withdrawal.ts';
@@ -18,13 +18,23 @@ export interface SingleFactIntent {
   /** Speaker of the new claim; a fact another known speaker asserted is never its duplicate. */
   attributed_to?: FactAttribution | null;
 }
-/** Provider work belongs to preparation, never to a page/source transaction. `disabled`: the brain opted out of embedding. */
-export async function prepareFactEmbedding(fact: string, signal?: AbortSignal, disabled = false): Promise<{ embedding: Float32Array | null; embedding_model: string | null; degraded: boolean }> {
+/** Preparation time kept back after the embed (a quarter of what is left, at most this): the dedup reads still run. */
+const EMBED_RESERVE_MS = 5_000;
+/**
+ * Provider work belongs to preparation, never to a page/source transaction. `disabled`: the brain opted out of embedding.
+ * `deadlineAt` (#8135): the preparation budget's end. The embed gets its own timeout short of it, and that timeout takes
+ * the no-vector fallback like any embed failure; without it a slow embedder let the budget's abort win, the attempt was
+ * charged, and the write ended `preparation_stalled` with nothing saved. The caller's own abort still propagates.
+ */
+export async function prepareFactEmbedding(fact: string, signal?: AbortSignal, disabled = false, deadlineAt?: number): Promise<{ embedding: Float32Array | null; embedding_model: string | null; degraded: boolean }> {
   signal?.throwIfAborted();
-  if (!disabled && isAvailable('embedding')) {
+  const remaining = deadlineAt === undefined ? Infinity : deadlineAt - Date.now();
+  const embedMs = remaining - Math.min(EMBED_RESERVE_MS, Math.floor(remaining / 4));
+  if (!disabled && isAvailable('embedding') && embedMs > 0) {
     try {
       const model = getEmbeddingModel();
-      return { embedding: await embedOne(fact, { abortSignal: signal, embeddingModel: model, inputType: 'document' }), embedding_model: model, degraded: false };
+      const abortSignal = Number.isFinite(embedMs) ? AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(embedMs)]) : signal;
+      return { embedding: await embedOne(fact, { abortSignal, embeddingModel: model, inputType: 'document' }), embedding_model: model, degraded: false };
     } catch { signal?.throwIfAborted(); }
   }
   return { embedding: null, embedding_model: null, degraded: true };
@@ -35,7 +45,15 @@ export async function prepareFactEmbedding(fact: string, signal?: AbortSignal, d
  */
 export async function assertFactNotWithdrawn(engine: BrainEngine, sourceId: string, input: SingleFactIntent, opts: { excludePrivate?: boolean } = {}): Promise<void> {
   await assertFactNotPurged(engine, sourceId, input);
-  if (!await isFactWithdrawn(engine, sourceId, input.visibility, input.fact, input.entity_slug)) return;
+  if (await isFactWithdrawn(engine, sourceId, input.visibility, input.fact, input.entity_slug)) throw await factWithdrawnRefusal(engine, sourceId, input, opts);
+}
+
+/**
+ * The refusal for a claim `isFactWithdrawn` matched. `withdrawn` comes from the withdrawal ledger alone (never a purge):
+ * the most specific subject first, then the newest withdrawal, among withdrawals the caller can see the withdrawn rows of
+ * (or that no row backs). It covers the exact normalized claim only.
+ */
+export async function factWithdrawnRefusal(engine: BrainEngine, sourceId: string, input: SingleFactIntent, opts: { excludePrivate?: boolean } = {}): Promise<OperationError> {
   if (opts.excludePrivate) {
     const [backing] = await engine.executeRaw<{ visible: boolean; hidden: boolean }>(`SELECT
         COALESCE(bool_or(${privateProvenanceFilterFragment('f')}), false) AS visible,
@@ -46,9 +64,20 @@ export async function assertFactNotWithdrawn(engine: BrainEngine, sourceId: stri
       WHERE f.source_id=$1 AND f.visibility=$2 AND f.expired_at IS NOT NULL
         AND gbrain_fact_fingerprint(f.fact)=gbrain_fact_fingerprint($3) AND (w.subject='*' OR w.subject=$4::text)`,
     [sourceId, input.visibility, input.fact, input.entity_slug]);
-    if (backing?.hidden && !backing.visible) throw pageNotVisibleError();
+    if (backing?.hidden && !backing.visible) return pageNotVisibleError();
   }
-  throw verbError('invalid_params', FACT_WITHDRAWN_MESSAGE, FACT_WITHDRAWN_SUGGESTION);
+  const [row] = await engine.executeRaw<{ subject: string; withdrawn_at: string; visibility: 'world' | 'private' }>(`SELECT w.subject,w.visibility,w.withdrawn_at::text AS withdrawn_at
+    FROM fact_withdrawals w LEFT JOIN facts f ON f.source_id=w.source_id AND f.visibility=w.visibility AND f.expired_at IS NOT NULL
+      AND w.fact_hash IN (gbrain_fact_fingerprint(f.fact),gbrain_fact_fingerprint_v1(f.fact)) AND (w.subject='*' OR w.subject=COALESCE(f.entity_slug,'*'))
+    WHERE w.source_id=$1 AND w.visibility=$2 AND w.fact_hash IN (gbrain_fact_fingerprint($3),gbrain_fact_fingerprint_v1($3))
+      AND (w.subject='*' OR w.subject=$4::text)
+    GROUP BY w.subject,w.visibility,w.withdrawn_at
+    HAVING $5::boolean=false OR COALESCE(bool_or(${privateProvenanceFilterFragment('f')}), false) OR NOT COALESCE(bool_or(f.id IS NOT NULL), false)
+    ORDER BY (w.subject<>'*') DESC, w.withdrawn_at DESC LIMIT 1`,
+  [sourceId, input.visibility, input.fact, input.entity_slug, opts.excludePrivate === true]);
+  const error = verbError('invalid_params', FACT_WITHDRAWN_MESSAGE, FACT_WITHDRAWN_SUGGESTION);
+  if (row) error.withdrawn = { at: new Date(row.withdrawn_at).toISOString(), subject: row.subject === '*' ? 'all_entities' : row.subject, visibility: row.visibility };
+  return error;
 }
 export const CANDIDATE_FUSION_KEY = 'facts.candidate_fusion';
 export type CandidateFusion = 'rrf_free' | 'interleave';
@@ -115,6 +144,25 @@ export async function decideSingleFact(engine: BrainEngine, sourceId: string, in
   return { status: 'inserted', candidate: null };
 }
 
+/** #6764: a conversation-derived fact changes when its page is re-extracted (forget + remember would only withdraw it). */
+function replacesDerivedSuggestion(sourceId: string, slug: string): string {
+  const base = `gbrain extract-conversation-facts --source-id ${sourceId} --slugs ${slug} --force`;
+  return `Re-extract the conversation page to change its facts: preview with ${base} --dry-run, then run ${base} --max-cost-usd <n> (paid).`;
+}
+
+/**
+ * #7248: a replacement whose visibility the caller did not set keeps a
+ * private target private, so replacing a private fact needs no flag. Only a
+ * local caller qualifies (a remote caller never sees a private fact), and a
+ * world target never widens a default.
+ */
+export async function replacementVisibility(engine: BrainEngine, sourceId: string, targetId: number,
+  defaulted: 'world' | 'private', opts: { remote: boolean }): Promise<'world' | 'private'> {
+  if (defaulted === 'private' || opts.remote || !Number.isSafeInteger(targetId)) return defaulted;
+  const [target] = await engine.executeRaw<{ visibility: string }>('SELECT visibility FROM facts WHERE id=$1 AND source_id=$2', [targetId, sourceId]);
+  return target?.visibility === 'private' ? 'private' : defaulted;
+}
+
 /**
  * `remember.replaces`: the caller names the fact the new one replaces. Checked,
  * zero-model: the target must be an active fact in this source with the same
@@ -131,9 +179,12 @@ export async function decideReplacement(engine: BrainEngine, sourceId: string, i
         AND (w.subject='*' OR w.subject=COALESCE(f.entity_slug,'*'))) AS withdrawn
     FROM facts f WHERE f.id=$1 AND f.source_id=$2${opts.excludePrivate ? ` AND ${privateProvenanceFilterFragment('f')}` : ''}${opts.lock ? ' FOR UPDATE OF f' : ''}`, [targetId, sourceId]);
   if (!target || (opts.remote && target.visibility !== 'world')) throw notFound();
-  if (target.visibility !== input.visibility) throw notFound();
   // #5913 [R2]: a slug-bound writer learns nothing about a fact outside its prefixes; the answer is the missing-id one.
   if (opts.slugPrefixes && [target.entity_slug, target.source_markdown_slug].some(slug => slug && !slugUnderBoundPrefixes(opts.slugPrefixes!, slug))) throw notFound();
+  if (target.visibility !== input.visibility) {
+    throw verbError('invalid_params', `replaces_visibility_mismatch: fact #${targetId} is ${target.visibility}, and the new fact would be ${input.visibility}.`,
+      `Pass visibility: "${target.visibility}" to replace it, or forget fact #${targetId} and remember the new claim separately.`);
+  }
   const candidate: FactCandidate = { ...target, id: Number(target.id) };
   if (target.withdrawn) {
     throw verbError('invalid_params', `target_withdrawn: fact #${targetId} was forgotten, so it cannot be replaced.`,
@@ -153,8 +204,9 @@ export async function decideReplacement(engine: BrainEngine, sourceId: string, i
       'Pass the same entity as the fact being replaced, or forget the old fact and remember the new one separately.');
   }
   if (candidate.source_markdown_slug && candidate.source_markdown_slug !== opts.pageSlug) {
-    throw verbError('invalid_params', `replaces_cross_page: fact #${targetId} lives on page ${candidate.source_markdown_slug}.`,
-      'Forget the old fact, then remember the new one.');
+    const derived = String(candidate.source ?? '').startsWith('cli:extract-conversation-facts');
+    throw verbError('invalid_params', `replaces_cross_page: fact #${targetId} lives on page ${candidate.source_markdown_slug}${derived ? ', extracted from that conversation page' : ''}.`,
+      derived ? replacesDerivedSuggestion(sourceId, candidate.source_markdown_slug) : 'Forget the old fact, then remember the new one.');
   }
   const exact = await decideSingleFact(engine, sourceId, input, null, undefined, undefined, { excludePrivate: opts.excludePrivate });
   if (exact.status === 'duplicate') {

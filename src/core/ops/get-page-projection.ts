@@ -9,6 +9,8 @@ import { renderTrustedText, type TrustFields } from '../eligibility/labels.ts';
 import { loadPageTrust } from '../eligibility/stamp.ts';
 import { resolveReadEligibility, type ReadEligibility } from '../eligibility/policy.ts';
 import { admitsTrust } from '../trust/tier.ts';
+import { rederiveHiddenSql } from '../eligibility/sql.ts';
+import { fenceTranscriptText, isQuotedPageType, neutralizeToolCalls, quotesTier } from '../search/transcript-quote.ts';
 
 /**
  * #6259: how a get_page reader sees a page the content-quality gate hid as junk.
@@ -45,6 +47,23 @@ export function readQuarantined(ctx: Pick<OperationContext, 'remote' | 'auth' | 
   return view;
 }
 
+/**
+ * #8042: an untrusted reader gets a third-party page's body quoted (get_page, fetch); trusted local reads stay raw.
+ * GST-687: so is a page whose trust tier is below the owner's (an agent-written note; `trust` from pageTrustForRead).
+ */
+export function quotesBody(ctx: Pick<OperationContext, 'remote'>, page: Pick<Page, 'type'>, trust: Pick<TrustFields, 'trust_tier'> | undefined): boolean {
+  return ctx.remote !== false && (isQuotedPageType(page.type) || quotesTier(trust?.trust_tier));
+}
+
+/**
+ * GST-687: an untrusted reader's reading shapes of a third-party page (get_page compiled_truth, timeline and view 'read'
+ * windows; fetch text) carry its tool-call blocks summarized, as search does. The round-trip shapes (include_content,
+ * view 'markdown') and gbrain's own thin client keep the stored bytes inside the fence.
+ */
+export function neutralizesBody(ctx: Pick<OperationContext, 'remote' | 'thinClient'>, page: Pick<Page, 'type'>): boolean {
+  return ctx.remote !== false && ctx.thinClient !== true && isQuotedPageType(page.type);
+}
+
 /** Wraps quarantined text for an untrusted reader as external data (eligibility/labels.ts). */
 function enveloped(text: string, fields: TrustFields | undefined): string {
   return text ? renderTrustedText(text, { trust_tier: 'external_untrusted', origin: fields?.origin ?? 'quarantined' }) : text;
@@ -63,10 +82,23 @@ export interface GetPageProjectionOpts {
   timeline_entries?: unknown;
   /** A held source file (sync could not import it); present in both shapes so an editor sees it. */
   file_held?: unknown;
+  /** GBRA-161 PR 2: the page's held facts or takes fence (`fence_absent`), each with its ask-the-user fix; present in both shapes. */
+  fence_held?: unknown;
   /** #6259: the page is quarantined; `body_omitted` drops compiled_truth, timeline and `content`. */
   quarantined?: QuarantinedView | null;
   /** #5575 A6: the page's trust tier and short write origin. */
   trust?: TrustFields;
+  /**
+   * #8042: the page's text is third-party and the reader untrusted: compiled_truth, timeline and `content` are fenced
+   * as quoted source material (text inside byte-exact; put_page removes the fences) and the response carries `quoted`.
+   */
+  quote?: boolean;
+  /**
+   * GST-687 (with `quote`): the reading shape carries tool-call blocks summarized. `includeContent` asks for the
+   * round-trip shape, which stays byte-exact inside the fence, unless `readingContent` (fetch's text is a reading shape).
+   */
+  neutralize?: boolean;
+  readingContent?: boolean;
 }
 
 /**
@@ -79,22 +111,30 @@ export interface GetPageProjectionOpts {
  * and revision included, so the write goes back to the page that was read), without
  * the duplicate compiled_truth / timeline / frontmatter the full shape carries
  * next to `content` (a 30 KB page otherwise comes back as ~62 KB).
+ * Both shapes carry `chars` (#7180): the characters of page text the response
+ * holds (compiled_truth, timeline and `content`), so a caller can budget.
  */
-export function projectGetPage(page: Page, o: GetPageProjectionOpts) {
+export function projectGetPage(stored: Page, o: GetPageProjectionOpts) {
   const { revision, tags, resolved_slug, content_flag, quarantined } = o;
+  const fence = (text: string) => (text ? fenceTranscriptText(text, stored.slug) : text);
+  const summarize = o.neutralize === true && (!o.includeContent || o.readingContent === true);
+  const read = (text: string) => fence(summarize && text ? neutralizeToolCalls(text) : text);
+  const page = o.quote ? { ...stored, compiled_truth: read(stored.compiled_truth), timeline: read(stored.timeline) } : stored;
   const omitted = quarantined?.body_omitted === true;
   const wrap = quarantined?.body_enveloped === true;
   const visibleBody = omitted ? { ...page, compiled_truth: '', timeline: '' }
     : wrap ? { ...page, compiled_truth: enveloped(page.compiled_truth, o.trust), timeline: enveloped(page.timeline, o.trust) } : page;
   const content = () => wrap ? enveloped(serializePageToMarkdown(page, tags), o.trust) : serializePageToMarkdown(visibleBody, tags);
   const extras = {
-    ...(quarantined ? { quarantined } : {}),
+    ...(quarantined ? { quarantined } : {}), ...(o.quote ? { quoted: 'transcript' as const } : {}),
     ...(o.timeline_entries !== undefined ? { timeline_entries: o.timeline_entries } : {}),
     ...(o.file_held !== undefined ? { file_held: o.file_held } : {}),
+    ...(o.fence_held !== undefined ? { fence_held: o.fence_held } : {}),
     ...(resolved_slug ? { resolved_slug } : {}), ...(content_flag ? { content_flag } : {}),
   };
   if (o.includeContent && o.contentOnly) {
     const deletedAt = visibleBody.deleted_at;
+    const text = omitted ? undefined : content();
     return {
       slug: visibleBody.slug,
       source_id: visibleBody.source_id,
@@ -102,16 +142,19 @@ export function projectGetPage(page: Page, o: GetPageProjectionOpts) {
       title: visibleBody.title,
       revision,
       tags,
-      ...(omitted ? {} : { content: content() }),
+      ...(text === undefined ? {} : { content: text }),
+      chars: text?.length ?? 0,
       ...(deletedAt ? { deleted_at: deletedAt } : {}),
       ...extras,
     };
   }
+  const text = o.includeContent && !omitted ? content() : undefined;
   return {
     ...visibleBody,
     revision,
     tags,
-    ...(o.includeContent && !omitted ? { content: content() } : {}),
+    ...(text === undefined ? {} : { content: text }),
+    chars: (visibleBody.compiled_truth ?? '').length + (visibleBody.timeline ?? '').length + (text?.length ?? 0),
     // #5575 A6: the reading shape carries the page's trust; the content_only round-trip shape stays minimal.
     ...(o.trust ?? {}),
     ...extras,
@@ -121,8 +164,9 @@ export function projectGetPage(page: Page, o: GetPageProjectionOpts) {
 /**
  * #5575 (A6, CEO-18, ENG-14): get_page and fetch read one page's trust once.
  * Returns its label fields and the read eligibility (for the page's timeline
- * rows), or null when the page sits below the effective read floor, which the
- * caller answers exactly like a missing page (no existence oracle).
+ * rows), or null when the page sits below the effective read floor or a purge
+ * hid it for re-derivation (even with include_deleted), which the caller
+ * answers exactly like a missing page (no existence oracle).
  */
 export async function pageTrustForRead(ctx: Pick<OperationContext, 'engine' | 'auth'>, page: Pick<Page, 'id'>, minTrust: unknown):
   Promise<{ trust: TrustFields; eligibility: ReadEligibility } | null> {
@@ -130,12 +174,16 @@ export async function pageTrustForRead(ctx: Pick<OperationContext, 'engine' | 'a
   const trust = (await loadPageTrust(ctx.engine, [{ page_id: page.id, slug: '' }]).catch(() => null))?.byId.get(page.id)
     ?? { trust_tier: 'unknown' as const, origin: 'unrecorded' };
   if (eligibility.floor && !admitsTrust(trust.trust_tier, eligibility.floor)) return null;
+  const [hidden] = await ctx.engine.executeRaw<{ n: number }>(
+    `SELECT count(*)::int AS n FROM pages p WHERE p.id = $1 AND NOT ${rederiveHiddenSql('pages', 'p')}`, [page.id]);
+  if (Number(hidden?.n) > 0) return null;
   return { trust, eligibility };
 }
 
-/** fetch's `text`: withheld for an unauthorized untrusted reader, enveloped for an authorized one (#6259, ENG-15). */
-export function projectFetchText(visibleBody: Page, tags: string[], quarantined: QuarantinedView | null, trust?: TrustFields): string {
-  if (quarantined?.body_omitted) return '';
-  const text = serializePageToMarkdown(visibleBody, tags);
-  return quarantined?.body_enveloped ? enveloped(text, trust) : text;
+/**
+ * fetch's `text`: get_page's round-trip `content`, so withheld for an unauthorized untrusted reader, enveloped for an authorized one (#6259, ENG-15),
+ * quoted with `quote` (#8042) and with tool-call blocks summarized with `neutralize` (GST-687: fetch is a reading shape).
+ */
+export function projectFetchText(visibleBody: Page, tags: string[], quarantined: QuarantinedView | null, trust?: TrustFields, quote = false, neutralize = false): string {
+  return projectGetPage(visibleBody, { revision: '', tags, includeContent: true, contentOnly: true, quarantined, trust, quote, neutralize, readingContent: true }).content ?? '';
 }

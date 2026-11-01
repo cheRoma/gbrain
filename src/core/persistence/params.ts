@@ -2,11 +2,31 @@ import type { ParamDef } from '../ops/contract.ts';
 
 /** Capture input sugar stays data; the owner materializes generated fields once. */
 export const CAPTURE_EVENT_PARAMS: Record<string, ParamDef> = {
-  who: { type: 'string', description: 'Event: comma-separated entity slugs.' },
-  what: { type: 'string', description: 'Event.' },
-  where: { type: 'string', description: 'Event place.' },
-  kind: { type: 'string', description: 'Event kind.' },
-  depth: { type: 'string', description: 'Event depth page to link.' },
+  who: { type: 'string', description: 'Event: comma-separated entity slugs.', fullSurfaceOnly: true },
+  what: { type: 'string', description: 'Event.', fullSurfaceOnly: true },
+  where: { type: 'string', description: 'Event place.', fullSurfaceOnly: true },
+  kind: { type: 'string', description: 'Event kind.', fullSurfaceOnly: true },
+  depth: { type: 'string', description: 'Event depth page to link.', fullSurfaceOnly: true },
+};
+/**
+ * #6524: the provenance the trusted local CLI stamps on its own captures
+ * (`capture-cli`, `stdin` / `cli-positional`; a `--file` capture sends
+ * `local_file` and the owner resolves its origin). `gbrain capture` has sent
+ * these since #5622, and a running `gbrain serve` (IPC owner) or a thin client
+ * reaches the op through dispatch, whose unknown-parameter check (#5970)
+ * rejects every undeclared key on a write. Declared so dispatch admits them;
+ * page-mutations.ts still replaces a remote caller's values with the
+ * server-stamped `mcp:capture`, so the trust posture is unchanged. Full
+ * surface only, like `content_origin`: the starter list keeps its size budget
+ * (test/mcp-schema-budget.test.ts) and agents never set these.
+ */
+export const CAPTURE_CLI_PROVENANCE_PARAMS: Record<string, ParamDef> = {
+  source_kind: { type: 'string', required: false, fullSurfaceOnly: true,
+    description: 'Trusted local CLI provenance (capture-cli); a remote caller\'s value is replaced by the server-stamped mcp:capture.' },
+  source_uri: { type: 'string', required: false, fullSurfaceOnly: true,
+    description: 'Trusted local CLI provenance (stdin, cli-positional); a remote caller\'s value is replaced by the server-stamped mcp:capture.' },
+  ingested_via: { type: 'string', required: false, fullSurfaceOnly: true,
+    description: 'Trusted local CLI provenance (capture-cli); a remote caller\'s value is replaced by the server-stamped mcp:capture.' },
 };
 import { WRITE_REQUEST_STATES, WRITE_HEALTH_REASONS, WRITE_HEALTH_ASSESSMENTS, WRITE_HEALTH_ACTIONS } from './types.ts';
 
@@ -16,7 +36,7 @@ import { WRITE_REQUEST_STATES, WRITE_HEALTH_REASONS, WRITE_HEALTH_ASSESSMENTS, W
  */
 export const WRITE_REQUEST_PARAM: ParamDef = {
   type: 'string',
-  description: 'Optional; reuse only to retry.',
+  description: 'Reuse only to retry.',
 };
 
 /** #6007: transport-only long-poll; never stored with the write or compared on replay. */
@@ -88,6 +108,7 @@ export const WRITE_RECEIPT_SCHEMA = {
         mode: { type: 'string', enum: ['filesystem', 'database'] },
         file_written: { type: 'boolean' },
         git_state: { type: 'string' },
+        git_commit: { type: 'string' },
       },
     },
     created_at: { type: 'string' },
@@ -100,6 +121,10 @@ export const WRITE_RECEIPT_SCHEMA = {
         assessment: { type: 'string', enum: [...WRITE_HEALTH_ASSESSMENTS] },
         reason: { type: 'string', enum: [...WRITE_HEALTH_REASONS] },
         next_action: { type: 'string', enum: [...WRITE_HEALTH_ACTIONS] },
+        owner: {
+          type: 'object', required: ['last_active'],
+          properties: { last_active: { type: ['string', 'null'] } },
+        },
       },
     },
   },

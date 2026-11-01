@@ -44,7 +44,8 @@ import type { McpSurface } from '../mcp/surface.ts';
 import { bindResolveIpcForServe } from '../mcp/resolve-ipc-binding.ts';
 import { createPersistenceIpcProvider, residentPersistenceConfig } from '../core/persistence/provider.ts';
 import { resolveMcpStdioSourceScope } from '../mcp/server.ts';
-import { loadConfig, type GBrainConfig } from '../core/config.ts';
+import { type GBrainConfig } from '../core/config.ts';
+import { loadServeConfigs } from '../mcp/serve-config.ts';
 import { buildError } from '../core/errors.ts';
 import * as db from '../core/db.ts';
 import { sqlQueryForEngine, type SqlQuery } from '../core/sql-query.ts';
@@ -396,6 +397,8 @@ interface ServeHttpOptions {
    * so per-client rows can narrow below it but never widen past it.
    */
   surface?: McpSurface;
+  /** --advertise: the surface tools/list shows to clients without their own surface (callable set unchanged). */
+  advertise?: McpSurface;
   /**
    * #2624: force-print the generated admin bootstrap token even on a
    * non-TTY (containerized) start. By default the raw token is only printed
@@ -474,6 +477,8 @@ export interface ServeHttpContext {
   logFullParams: boolean | undefined;
   /** --surface: the server tool-surface ceiling. */
   surface: McpSurface | undefined;
+  /** --advertise: what tools/list shows; null leaves it to mcp.advertised_surface. */
+  advertise?: McpSurface | null;
   /** Every non-localOnly operation: the only op list the network surface sees. */
   mcpOperationsBase: Operation[];
   issuerUrl: URL;
@@ -614,7 +619,7 @@ export async function buildServeHttpApp(app: express.Express, engine: BrainEngin
   // a misconfiguration; we WARN to stderr at startup in that case rather
   // than silently binding loopback only.
   const bind = options.bind ?? '127.0.0.1';
-  const config = loadConfig() || { engine: 'pglite' as const };
+  const config = (await loadServeConfigs(engine)).operationConfig || { engine: 'pglite' as const }; // #6589: CLI parity, read once
 
   const skillStatus = await logServeHttpStartup(engine, options, config);
 
@@ -815,7 +820,7 @@ export async function buildServeHttpApp(app: express.Express, engine: BrainEngin
   const requireAdmin = createRequireAdmin(adminSessions);
   const { ingestRateLimiter, githubWebhookLimiter } = createWebhookLimiters();
   const ctx: ServeHttpContext = {
-    noticeLedger: new NoticeLedger(), readinessCache: createReadinessCache(), engine, config, sql, bind, enableDcr, logFullParams, surface: options.surface, mcpOperationsBase,
+    noticeLedger: new NoticeLedger(), readinessCache: createReadinessCache(), engine, config, sql, bind, enableDcr, logFullParams, surface: options.surface, advertise: options.advertise ?? null, mcpOperationsBase,
     issuerUrl, mcpResourceUrl, resourceMetadataUrl, oauthProvider, resourceVerifier,
     bootstrapHash, adminSessions, adminCookie,
     magicLinkNonces: new Map<string, number>(),
@@ -912,7 +917,11 @@ ${bootstrapFromEnv
   // #6317 (B4): one notice when a managed source's sync data stops moving (reader in persistence/sync-movement.ts).
   const { startMovementWatch } = await import('../core/persistence/sync-movement.ts');
   const movementWatch = startMovementWatch(engine, { log: (line) => console.error(line) });
+  // #6858 ask 6: on-commit sync of this host's managed checkouts while `sync.on_commit` is on (serve-head-watcher.ts).
+  const { startServeHeadWatcher } = await import('../core/serve-head-watcher.ts');
+  const headWatcher = startServeHeadWatcher(engine, { log: (line) => console.error(line), resident: 'serve-http' });
   const deregisterEngineCleanup = registerCleanup('pglite-engine-disconnect', async () => {
+    await headWatcher.stop();
     movementWatch.stop();
     await factsDrain.stop();
     await engine.disconnect();
@@ -920,6 +929,7 @@ ${bootstrapFromEnv
   try {
     await waitForHttpServerLifecycle(httpServer);
   } finally {
+    await headWatcher.stop();
     movementWatch.stop();
     await factsDrain.stop();
     // Close the IPC listener + reap the socket file on orderly shutdown

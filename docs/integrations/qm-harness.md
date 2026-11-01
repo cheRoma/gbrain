@@ -87,10 +87,10 @@ boundary, and it does not make every side effect prefix-clean:
   page content. Unreachable in the layout above (the `agents` source is
   path-less and holds no code pages); it applies only if you point employee
   writes at a code-synced source.
-- **Stored contradiction reports are temporarily local-only.**
-  `find_contradictions` returns stored findings only to trusted local callers
-  without a source filter. Harness clients receive `{ contradictions: [], note }`
-  with an availability note. Other brain-wide read ops (`get_recent_salience`,
+- **Stored contradiction findings are filtered per caller.**
+  `find_contradictions` returns a harness client only the findings whose two
+  sides it can read in its grant, re-read live with `source_id` and
+  `trust_tier`; stored report text never leaves. Other brain-wide read ops (`get_recent_salience`,
   `find_anomalies`, and `sources_list`/`sources_status`) honor the federated
   grant; `sources_status` answers `not_found` for an out-of-grant ID.
 - **Reads touch `last_retrieved_at`** (in `page_retrievals`) on the pages they return, including
@@ -131,10 +131,18 @@ gbrain config set mcp.publish_advisor true
 gbrain sources add org-wiki --path ~/brains/org-wiki
 gbrain sync --all        # cron this
 
-# 4. Serve over HTTP MCP (OAuth 2.1):
+# 4. Serve over HTTP MCP (OAuth 2.1), listing the 7 memory verbs:
 gbrain serve --http --bind 0.0.0.0 --port 3131 \
-  --public-url https://brain.acme-example.com
+  --public-url https://brain.acme-example.com --advertise verbs
 ```
+
+`--advertise verbs` is the registration default gbrain's own installers use
+(`--surface starter --advertise verbs` since v0.60.503.0). QM sends every listed
+tool schema on every request, so a bare serve costs each turn about 11,800 input
+tokens for 33 tool schemas; with `--advertise verbs` it lists the seven verbs
+plus `request_tools`. Every operation stays callable, so the `gbrain` tool in the
+sandbox keeps working: the server keeps the `full` ceiling here because the
+skill's `gbrain link` (`add_link`) is outside `starter`.
 
 Never hand sandboxes `DATABASE_URL` — direct DB access bypasses OAuth, source
 federation, and the write fence entirely.

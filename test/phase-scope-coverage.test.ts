@@ -52,14 +52,9 @@ describe('PHASE_SCOPE coverage', () => {
     // adds 'facts_drain' for 25.
     // Temporal typed edges adds 'edge_contradictions' for 26; C4 pinned
     // questions adds 'standing_questions' for 27.
-    // #6188 adds 'fence_repair' for 28; #6377 adds 'content_repair' for 29.
-    //
-    // FORK DELTA (link_chat branch): this branch carries its own
-    // 'link_chat' phase on top of upstream's set, so the count here is
-    // upstream + 1. Every merge from upstream/master reintroduces the
-    // upstream pin — re-apply this +1 instead of deleting the phase.
-    expect(ALL_PHASES.length).toBe(30);
-    expect(Object.keys(PHASE_SCOPE).length).toBe(30);
+    // #6188 adds 'fence_repair' for 28; #6377 adds 'content_repair' for 29; #6865 adds 'unindexed_files' for 30.
+    expect(ALL_PHASES.length).toBe(31); // Fork: upstream phases + link_chat.
+    expect(Object.keys(PHASE_SCOPE).length).toBe(31); // Fork: upstream phases + link_chat.
   });
 
   test('embed remains global (the headline brain-wide phase)', () => {

@@ -22,6 +22,7 @@ import {
 } from './tier.ts';
 import { frontmatterTrustCaps } from './channel.ts';
 import { maintenanceTransaction } from '../persistence/attribution.ts';
+import { propagateTierLowering } from './propagation.ts';
 
 /** A row placed in a model's context: by id, or a page by its (source, slug) coordinate. */
 export type TaintRef = { table: TaintTable; id: number } | { table: 'pages'; sourceId: string; slug: string };
@@ -126,11 +127,17 @@ export async function lowerToDerivedTier(tx: Sql, table: TaintTable, ids: readon
     `UPDATE ${table} SET trust_tier=$2,write_origin=$3::text::jsonb
       WHERE id=ANY($1::bigint[]) AND ${trustRankSql('trust_tier')}>${trustRankSql('$2::text')} RETURNING id`,
     [[...ids], trust.tier, trust.origin ? JSON.stringify(trust.origin) : null]);
-  return rows.map(row => Number(row.id));
+  const lowered = rows.map(row => Number(row.id));
+  // W1 #6783 §12 (b): what was derived from a lowered row follows it down.
+  if (lowered.length) await propagateTierLowering(tx as BrainEngine, lowered.map(id => ({ table, id })));
+  return lowered;
 }
 
-/** A row a derivation wrote, for the lowering and edge pass. */
-export interface DerivedRowRef { table: TaintTable; id: number; sourceId?: string | null }
+/**
+ * A row a derivation wrote, for the lowering and edge pass. `prior` (#7917): an existing page's slug and the tier and
+ * revision read before the write, so a page the derivation lowered files a `lower_page` proposal for the owner.
+ */
+export interface DerivedRowRef { table: TaintTable; id: number; sourceId?: string | null; prior?: { slug: string; tier: TrustTier; revision: string | null } }
 
 /**
  * An unmanaged deriver's write: one attributed maintenance transaction at the
@@ -144,6 +151,10 @@ export async function derivedMaintenanceTransaction<T>(engine: BrainEngine, deri
     for (const row of rows) {
       await lowerToDerivedTier(tx, row.table, [row.id], derivation.trust);
       await recordTaintEdges(tx, row, derivation.inputs);
+      if (row.table !== 'pages' || !row.prior || !row.sourceId) continue;
+      const { recordAgentPageLowering } = await import('./page-write.ts');
+      await recordAgentPageLowering(tx, { operation: 'derived_maintenance', source_id: row.sourceId, slug: row.prior.slug }, row.prior,
+        `derived_page:${String(derivation.trust.origin?.channel ?? 'maintenance')}`);
     }
     return result;
   }, derivation.trust);

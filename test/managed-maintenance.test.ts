@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ensureCorpusSpoolDir, sessionCorpusFileName } from '../src/core/context/corpus-segments.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runPhaseConsolidate } from '../src/core/cycle/phases/consolidate.ts';
@@ -301,7 +302,7 @@ test('consolidation retains a bounded semantic intent and honors configured admi
     await seed(engine, sourceId);
     await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
     const limits = await readJournalLimits(engine);
-    expect(limits.principalIntentBytes).toBe(32 * 1024 ** 2);
+    expect(limits.principalIntentBytes).toBe(64 * 1024 ** 2);
     expect(limits.brainIntentBytes).toBe(256 * 1024 ** 2);
     const key = 'persistence.limits.principal_intent_bytes';
     const original = await engine.getConfig(key);
@@ -438,7 +439,7 @@ for (const failure of ['commit', 'withdrawal'] as const) {
 test('managed synthesis drives real children and publishes repaired provenance plus summary without repeated model calls', async () => {
   await fixture(async (engine, sourceId, root) => {
     await seed(engine, sourceId);
-    const transcript = join(root, '2026-09-20-session.txt');
+    const transcript = join(ensureCorpusSpoolDir(root), sessionCorpusFileName('2026-09-20-session', sourceId));
     const quote = 'we charge for durability because reliable memories should survive every tool';
     writeFileSync(transcript, `User: ${quote}.\n${'Assistant: Discuss the long term roadmap.\n'.repeat(15)}`);
     await engine.setConfig('dream.synthesize.enabled', 'true');

@@ -20,12 +20,16 @@ import type { TrustTier } from '../trust/tier.ts';
 import { EXTERNAL_DATA_RULE, needsDataEnvelope, trustAttributes } from '../eligibility/labels.ts';
 import { hybridSearch } from '../search/hybrid.ts';
 import { INTERNAL_BREADTH_SEARCH_OPTS } from '../search/internal-breadth.ts';
-import { sanitizeRemoteBody } from '../remote-body.ts';
+import { resolveHardExcludes } from '../search/source-boost.ts';
+import { boundedProjectedPrefix } from '../page-window/document.ts';
+import { overlaidBoundedRows, pageLeadSource } from '../page-window/bounded-lead.ts';
 import type { Page, SearchResult } from '../types.ts';
 import { DEFAULT_PAGES_BUDGET, PAGES_BLOCK_EXCERPT_FLOOR_CHARS, type PagesBudget } from './pages-budget.ts';
 import { filterPagesToWindow, type TemporalWindow } from './temporal-window.ts';
 import { pageContentDate } from './temporal-context.ts';
 import { sanitizeQueryForPrompt } from '../search/expansion.ts';
+import { evidenceTitle } from '../search/evidence-date.ts';
+import { fenceTranscriptText, neutralizeToolCalls, quoteLabel } from '../search/transcript-quote.ts';
 import { ensureWellFormed } from '../text-safe.ts';
 import { CJK_SLUG_CHARS } from '../cjk.ts';
 import type { IntentAsk } from '../search/decide-retrieval.ts';
@@ -135,7 +139,12 @@ export async function runGather(
   const pageScope = { ...sourceScope, excludePrivate: opts.excludePrivate, requireSafeChunks: opts.remote !== false, takesHoldersAllowList: opts.takesHoldersAllowList };
   // System One: gather searches run S3/S5 under call site `think` (remote spend counted as remote).
   const decide = { remote: opts.remote !== false, callSite: 'think', ...(opts.decideIntent ? { intent: opts.decideIntent } : {}) };
-  const visibleBody = (body: string) => opts.remote === false ? body : sanitizeRemoteBody(body);
+  // Large pages: a page row's text is a bounded, withdrawal-overlaid prefix
+  // (raw for the trusted local CLI, the sanitized projection otherwise), never the whole body.
+  // A segmented page's lead source is its stored truth_lead (its body fields throw).
+  const visibleLeads = async (rows: Page[]): Promise<string[]> =>
+    (await overlaidBoundedRows(engine, await Promise.all(rows.map(async p => ({ slug: p.slug, source_id: p.source_id ?? 'default', compiled_truth: await pageLeadSource(engine, p) ?? '' })))))
+      .map(r => opts.remote === false ? r.compiled_truth ?? '' : boundedProjectedPrefix(r.compiled_truth));
 
   // Sanitize the question for any path that includes it in an LLM prompt.
   // (Direct DB search is fine — those are parameterized queries.)
@@ -144,9 +153,9 @@ export async function runGather(
   const warnings: string[] = [];
   const window = opts.window;
 
-  const toSearchResult = (page: Page, rank: number): SearchResult => ({
+  const toSearchResult = (page: Page, rank: number, lead: string): SearchResult => ({
     slug: page.slug, page_id: page.id, title: page.title, type: page.type,
-    chunk_text: visibleBody(page.compiled_truth ?? ''), chunk_source: 'compiled_truth',
+    chunk_text: lead, chunk_source: 'compiled_truth',
     chunk_id: 0, chunk_index: 0, score: 1 / (51 + rank), stale: false,
     source_id: page.source_id ?? 'default',
     effective_date: page.effective_date instanceof Date ? page.effective_date.toISOString() : null,
@@ -172,7 +181,11 @@ export async function runGather(
       ...(window.startMs !== null ? { effective_after: new Date(window.startMs).toISOString() } : {}),
       ...(window.endMs !== null ? { effective_before: new Date(window.endMs).toISOString() } : {}),
       limit: 50, ...pageScope,
-    }).then(pages => pages.map(toSearchResult)).catch((e) => {
+      excludeSlugPrefixes: resolveHardExcludes(),
+    }).then(async pages => {
+      const leads = await visibleLeads(pages);
+      return pages.map((page, rank) => toSearchResult(page, rank, leads[rank]!));
+    }).catch((e) => {
       warnings.push('GATHER_WINDOW_FLOOR_FAILED');
       process.stderr.write(`[think.gather] window floor failed: ${(e as Error).message}\n`);
       return [] as SearchResult[];
@@ -273,7 +286,7 @@ export async function runGather(
       source_id: anchorPage.source_id ?? 'default',
       title: anchorPage.title,
       type: anchorPage.type,
-      chunk_text: visibleBody(anchorPage.compiled_truth),
+      chunk_text: (await visibleLeads([anchorPage]))[0]!,
       chunk_source: 'compiled_truth',
       chunk_id: 0,
       chunk_index: 0,
@@ -636,7 +649,7 @@ export function renderPagesBlockDetailed(
   pages: SearchResult[],
   excerptLen = 600,
   query = '',
-  opts: { verbatim?: boolean | ((p: SearchResult) => boolean); verbatimLen?: number; timeZone?: string } = {},
+  opts: { verbatim?: boolean | ((p: SearchResult) => boolean); verbatimLen?: number; timeZone?: string; titles?: boolean } = {},
 ): { text: string; truncated: boolean } {
   let truncated = false;
   const text = pages.map((p, idx) => {
@@ -652,16 +665,22 @@ export function renderPagesBlockDetailed(
     const slug = String(page.slug ?? '');
     const title = String(page.title ?? '');
     const slugIdentity = slug.split('/').pop()?.replace(/[-_]/g, ' ') ?? '';
-    const content = String(page.chunk_text ?? page.compiled_truth ?? page.snippet ?? '');
+    const raw = String(page.chunk_text ?? page.compiled_truth ?? page.snippet ?? '');
+    // #8042: a chat page's text is quoted (tool calls summarized before the excerpt, the rendered text fenced).
+    const quote = quoteLabel({ ...p, chunk_text: raw });
+    const content = quote === null ? raw : neutralizeToolCalls(raw);
+    const quoted = (text: string) => (quote === null ? text : fenceTranscriptText(text, quote));
     const flag = (p.injection_suspected ? `${INJECTION_SUSPECTED_LINE}\n` : '')
       + (p.trust_tier && needsDataEnvelope(p.trust_tier) ? `${EXTERNAL_DATA_RULE}\n` : '') + graphEvidenceLine(p);
     const trustAttr = p.trust_tier ? ` ${trustAttributes({ trust_tier: p.trust_tier, origin: p.origin ?? 'legacy' })}` : '';
+    const cleanTitle = opts.titles ? evidenceTitle(title) : '';
+    const titleAttr = cleanTitle ? ` title="${cleanTitle}"` : '';
     // Evidence delivery: the block was already budgeted and cut around its
     // hits; render it whole (capped only by excerptLen).
     if (typeof opts.verbatim === 'function' ? opts.verbatim(p) : opts.verbatim) {
       const cap = opts.verbatimLen ?? excerptLen;
       if (content.length > cap || (p as { delivered?: { truncated?: boolean } }).delivered?.truncated === true) truncated = true;
-      return `<page slug="${slug}" rank="${idx + 1}"${dateAttr}${trustAttr}>\n${flag}${content.slice(0, cap)}\n</page>`;
+      return `<page slug="${slug}" rank="${idx + 1}"${titleAttr}${dateAttr}${trustAttr}>\n${flag}${quoted(content.slice(0, cap))}\n</page>`;
     }
     const excerpt = selectRelevantExcerptDetailed(
       content,
@@ -674,7 +693,7 @@ export function renderPagesBlockDetailed(
       (excerpt.truncatedStart ? `${EXCERPT_CUT_START_MARKER}\n` : '') +
       excerpt.text +
       (excerpt.truncatedEnd ? `\n${EXCERPT_CUT_END_MARKER}` : '');
-    return `<page slug="${slug}" rank="${idx + 1}"${dateAttr}${trustAttr}>\n${flag}${body}\n</page>`;
+    return `<page slug="${slug}" rank="${idx + 1}"${titleAttr}${dateAttr}${trustAttr}>\n${flag}${quoted(body)}\n</page>`;
   }).join('\n\n');
   return { text, truncated };
 }
