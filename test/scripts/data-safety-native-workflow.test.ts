@@ -64,7 +64,7 @@ describe('data-safety native CI coverage', () => {
     const finalize = (workflow.jobs as unknown as Record<string, { needs: string[]; if: string; 'runs-on': string; permissions: Record<string, string>; steps: Step[] }>)['heartbeat-finalize']!;
     expect(finalize.needs).toEqual(['native']);
     expect(finalize.if).toBe("${{ always() && inputs.scope != 'smoke' }}");
-    expect(finalize['runs-on']).toBe('ubicloud-standard-2-ubuntu-2404');
+    expect(finalize['runs-on']).toBe('ubuntu-24.04'); // Fork uses GitHub-hosted runners.
     expect(finalize.permissions).toEqual({ actions: 'read', contents: 'read', statuses: 'write' });
     const step = finalize.steps.at(-1)!;
     expect(step).toEqual({ name: 'Finalize darwin-x64 heartbeats left pending', run: 'bun scripts/native/heartbeat-finalize.ts', env: {
