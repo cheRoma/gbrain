@@ -26,7 +26,7 @@ const usesUbicloud = readFileSync(join(root, '.github/workflows/test.yml'), 'utf
 
 describe.skipIf(!usesUbicloud)('CI runner routing', () => {
   test('owned Linux validation jobs use Ubicloud without moving release publishing', () => {
-    for (const file of ['test.yml', 'e2e.yml', 'heavy-tests.yml', 'persistence-validation.yml', 'convergence-nightly.yml', 'native-locks.yml', 'actionlint.yml', 'semgrep.yml']) {
+    for (const file of ['test.yml', 'e2e.yml', 'heavy-tests.yml', 'persistence-validation.yml', 'convergence-nightly.yml', 'native-locks.yml', 'actionlint.yml', 'semgrep.yml', 'harness-check.yml']) {
       for (const job of Object.values(load(file).jobs)) {
         const runner = job['runs-on'];
         if (!runner || runner.startsWith('${{')) continue;
