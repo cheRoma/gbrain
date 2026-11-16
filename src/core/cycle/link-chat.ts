@@ -42,6 +42,7 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { listSources } from '../sources-ops.ts';
+import { withoutGuestSources } from '../guests/derived.ts';
 import { findOrphans } from '../../commands/orphans.ts';
 import { serializeMarkdown } from '../markdown.ts';
 import { withCoordinatedWrite } from '../persistence/context.ts';
@@ -151,9 +152,11 @@ export function hubCandidates(project: string): string[] {
   // Hand-made hubs across EVERY spelling outrank an auto-created `_index` from
   // an earlier run, so a brain that accumulated duplicates converges on the
   // real hub instead of entrenching the split.
+  // `hub` outranks `index`: where a project kept both, the older `index` was
+  // merged into `hub` and left as a redirect stub.
   const canonical = names.flatMap((n) => [
-    `projects/${n}/index`,
     `projects/${n}/hub`,
+    `projects/${n}/index`,
     `projects/${n}`,
   ]);
   const autoCreated = names.map((n) => `projects/${n}/_index`);
@@ -269,7 +272,10 @@ export async function runPhaseLinkChat(
   }
 
   const startedAt = Date.now();
-  const sources = await listSources(engine);
+  // A guest source is database-only and refuses owner writes; link_chat walks
+  // every source itself, so it drops guest sources here (fails closed: none
+  // when the guest lookup fails).
+  const sources = await withoutGuestSources(engine, 'link_chat', await listSources(engine), (s) => s.id);
 
   let linked = 0;
   let hubsCreated = 0;

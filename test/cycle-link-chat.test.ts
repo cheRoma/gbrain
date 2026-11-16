@@ -215,6 +215,21 @@ describe('runPhaseLinkChat — existing hub reuse', () => {
     expect(backlinks.map((b) => b.from_slug)).toContain('projects/agent/hub');
   });
 
+  test('prefers projects/<name>/hub over a projects/<name>/index stub when both exist', async () => {
+    await engine.setConfig('cycle.link_chat.enabled', 'true');
+    await seedHub('projects/k73-passport/index'); // older hub kept as a redirect stub
+    await seedHub('projects/k73-passport/hub');
+    await seedChat('chat/2026-07-13-k73-passport-5c0ffee1');
+
+    await runPhaseLinkChat(engine, {});
+
+    const backlinks = await engine.getBacklinks('chat/2026-07-13-k73-passport-5c0ffee1', {
+      sourceId: 'default',
+    });
+    expect(backlinks.map((b) => b.from_slug)).toContain('projects/k73-passport/hub');
+    expect(backlinks.map((b) => b.from_slug)).not.toContain('projects/k73-passport/index');
+  });
+
   test('matches an existing hub across underscore/hyphen spelling', async () => {
     await engine.setConfig('cycle.link_chat.enabled', 'true');
     await seedHub('projects/crm-detailing/index');

@@ -4,7 +4,7 @@
 <!-- Regenerate: bun run scripts/generate-tool-catalog.ts -->
 <!-- Freshness-guarded by scripts/check-tool-catalog-fresh.sh (bun run verify). -->
 
-Every non-localOnly operation on the MCP surface: 171 tools across 26 areas. **Starter** marks membership in the ~41-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
+Every non-localOnly operation on the MCP surface: 176 tools across 27 areas. **Starter** marks membership in the ~41-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
 
 ## admin
 
@@ -147,6 +147,7 @@ Every non-localOnly operation on the MCP surface: 171 tools across 26 areas. **S
 | `confirm_memory` | Owner only: mark a fact, take or page as confirmed by the user (trust tier user_confirmed). | write |  |  |
 | `extract_facts` | Extract personal-knowledge facts (events, preferences, commitments, beliefs, ideas, and plain facts) from a conversation turn into the per-source hot memory. | write |  |  |
 | `forget_fact` | Forget a fact by recording a durable withdrawal in its source and visibility. | write |  |  |
+| `memory_propose` | Propose one timeline entry or link on a shared page for the person this call serves; the brain owner approves it before it is written. | write |  |  |
 | `memory_recall` | Facts for the person this call serves, one per line: their own recent facts first, then facts matching query. | read |  |  |
 | `memory_write` | Save facts for the person this call serves, readable by them alone. | write |  |  |
 
@@ -167,7 +168,7 @@ Every non-localOnly operation on the MCP surface: 171 tools across 26 areas. **S
 | `entity` | Person/company/account card, zero LLM. | read | yes |  |
 | `forget` | Expire a remembered fact by its fact_id (never a page slug). | write | yes |  |
 | `recall` | Read facts by entity, since or session_id; `query` also searches pages. | read | yes |  |
-| `remember` | Save {fact, provenance (required: source), `entity` (subject; recall needs it)} or items[]. | write | yes |  |
+| `remember` | Save {fact, provenance (required), `entity` (subject; recall needs it)} or items[]. | write | yes |  |
 | `synthesize` | [EXPENSIVE / SLOW: LLM calls] Cited answer to a broad question across pages. | read | yes |  |
 
 ## ontology
@@ -203,6 +204,7 @@ Every non-localOnly operation on the MCP surface: 171 tools across 26 areas. **S
 | `list_pages` | List pages by type, slug_prefix, frontmatter where; what did I touch this week: sort=updated_desc. | read | yes |  |
 | `list_write_conflicts` | Pages whose writes keep ending in a source_changed conflict, grouped by slug. | read |  |  |
 | `list_write_requests` | Your write receipts in one source, newest first (for a lost request_id). | write | yes |  |
+| `promote_guest_note` | Owner only: keep a guest note (a page in a guest source, origin "guest") as an owner page. | write |  |  |
 | `put_page` | Complete content REPLACES the whole page: read get_page include_content:true; its revision is expected_revision. | write | yes |  |
 | `put_pages` | Write up to 50 complete Markdown pages (8 MB total) in one call; use instead of put_page for more than 3 pages. | write |  |  |
 | `put_raw_data` | Store a raw provider payload (API response JSON) alongside a page, keyed by source. | write |  |  |
@@ -277,6 +279,14 @@ Every non-localOnly operation on the MCP surface: 171 tools across 26 areas. **S
 | `sources_remove` | Hard-remove a source (cascades pages/chunks/embeddings). | sources_admin |  |  |
 | `sources_resolve_path` | Read-only: what gbrain did with each file path of a source, by its own rules. | read |  |  |
 | `sources_status` | Per-source diagnostic. | read |  |  |
+
+## storage
+
+| Tool | Description | Scope | Starter | Gate |
+|---|---|---|---|---|
+| `storage_find` | Find archived items on the storage shelf (files moved to B2, Supabase Storage, S3 and similar) by a plain phrase, such as "the October Gmail dataset". | read |  |  |
+| `storage_get` | Read one card from the storage shelf by id: what the item is, every stored copy (store, bucket, path, restic repository and snapshot, size, hash, when verified), the original path, why it was archived, the restore form (restore.skill and restore.args, run by the agent's own restore skill; cards carry no commands or credentials), past restores, who registered it, and its revision. | read |  |  |
+| `storage_list` | List cards on the storage shelf, sorted by id, optionally filtered by store, status or whether a copy is still on the source machine. | read |  |  |
 
 ## tags
 

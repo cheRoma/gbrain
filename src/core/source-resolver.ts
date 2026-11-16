@@ -311,7 +311,7 @@ export function resolveSourceIdEngineFree(
  *     GBRAIN_NO_SOLE_NON_DEFAULT_NUDGE=1) so the reroute is diagnosable.
  *
  * Excludes archived sources (`archived = false`) so a soft-deleted source
- * doesn't auto-resolve. Shared by `resolveSourceId` and `resolveSourceWithTier`
+ * doesn't auto-resolve, and the storage manifest (GST-1943), which only the storage verbs write. Shared by `resolveSourceId` and `resolveSourceWithTier`
  * so the heuristic can't drift between the two entry points.
  *
  * NOTE (#2928): this tier deliberately does NOT consult config.federated —
@@ -376,11 +376,11 @@ async function pickSoleNonDefaultSource(
       `SELECT 1 AS one FROM pages WHERE source_id = 'default' AND deleted_at IS NULL LIMIT 1`,
     ).then(found => found.length > 0);
   defaultHasPages.catch(() => {});
-  let rows: Array<{ id: string }> = request ? request.filter(row => row.local_path !== null && row.id !== 'default' && row.archived === false) : [];
+  let rows: Array<{ id: string }> = request ? request.filter(row => row.local_path !== null && row.id !== 'default' && row.archived === false && parseSourceConfig(row.config).role !== 'storage_manifest') : [];
   if (!request) {
     try {
       rows = await engine.executeRaw<{ id: string }>(
-        `SELECT id FROM sources WHERE local_path IS NOT NULL AND id != 'default' AND archived = false`,
+        `SELECT id FROM sources WHERE local_path IS NOT NULL AND id != 'default' AND archived = false AND config->>'role' IS DISTINCT FROM 'storage_manifest'`,
       );
     } catch {
       rows = await engine.executeRaw<{ id: string }>(
@@ -963,6 +963,15 @@ export async function noGrantFederatedScope(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * #8982: whether a caller with no source grant reads `sourceId` unqualified: `default`, or a source in the federated
+ * set noGrantFederatedScope threads for that floor. Throws when the sources cannot be read, so a write policy keyed on
+ * it fails closed instead of treating an unreadable table as "not shared".
+ */
+export async function noGrantFloorReads(engine: BrainEngine, sourceId: string): Promise<boolean> {
+  return sourceId === 'default' || ((await localFederatedSourceIds(engine, 'default', 'seed_default'))?.includes(sourceId) ?? false);
 }
 
 /**

@@ -80,6 +80,13 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async (engine, scope) => { const { derivedVisibilityCheck } = await import('./checks/derived-visibility.ts'); return perSource(scope, id => derivedVisibilityCheck(engine, id)); },
   },
   {
+    id: 'privacy_label_ignored', resolution: 'operator', registration: 'wave',
+    count: d => Number(d.pages ?? 0),
+    impact: 'Some pages carry an access or confidentiality value gbrain does not read as private, so the label does not hide them from remote callers or keep them out of git',
+    instruction: 'List the pages with `gbrain list --where <key>=<value> --json` on the brain host and add `visibility: private` to each page that should stay private; gbrain rewrites no label itself.',
+    run: async (engine, scope) => (await import('./checks/privacy-label-ignored.ts')).privacyLabelIgnoredCheck(engine, scope.sourceIds),
+  },
+  {
     id: 'safe_index_pending', resolution: 'repair', registration: 'wave',
     count: d => Number(d.pages_pending ?? 0),
     impact: 'Some pages are below the safe-chunk index version and are withheld from remote search',
@@ -180,6 +187,14 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async (engine, scope) => (await import('./checks/frontmatter-hook.ts')).frontmatterHookCheck(engine, scope.sourceIds),
   },
   {
+    id: 'url_source_origin', resolution: 'operator', registration: 'wave',
+    hostOnly: 'Which caller added a source is a decision only the brain host operator can record.',
+    count: d => Number(d.count ?? 0),
+    impact: 'Some URL source clones have no record of who added them, so their reclones use the clone settings of a local add',
+    instruction: 'Ask the user which of the listed sources a remote caller added; on the brain host, preview `gbrain sources record-origin <id>... --remote` (`--local` for the rest), then rerun it with --apply.',
+    run: async engine => (await import('./checks/url-source-origin.ts')).urlSourceOriginCheck(engine),
+  },
+  {
     id: 'orphan_persistence_bindings', resolution: 'repair', registration: 'wave',
     hostOnly: 'Bindings of removed sources are brain-wide persistence bookkeeping outside any source scope.',
     count: d => Number(d.count ?? 0),
@@ -243,6 +258,20 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     impact: 'A dream synthesis key keeps dying and was paid for on each attempt',
     instruction: 'Fix the cause, then reset the breaker with the command doctor prints.',
     run: async engine => (await import('./checks/dream-breaker.ts')).dreamPaidLoopCheck(engine),
+  },
+  {
+    id: 'dream_write_deferred', resolution: 'operator', registration: 'wave',
+    count: d => (d.items ?? []).filter((item: { replays: number; bound: number }) => item.replays >= item.bound).length,
+    impact: 'A dream phase write is still pending after its replay bound, so the phase submits nothing more for that source',
+    instruction: 'Read the receipt with the `gbrain write-request` command doctor prints; if the writer is stuck, `gbrain sources writer status --source <id> --json` names why.',
+    run: async (engine, scope) => (await import('./checks/dream-write-deferred.ts')).dreamWriteDeferredCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'embedding_restamp_stalled', resolution: 'operator', registration: 'wave',
+    count: d => (d.last ? 1 : 0),
+    impact: 'The free embedding signature restamp keeps failing, so current vectors still read as another model\'s space',
+    instruction: 'Fix the error doctor prints, then run `gbrain dream --phase embed` once.',
+    run: async engine => (await import('./checks/embedding-restamp.ts')).embeddingRestampStalledCheck(engine),
   },
   {
     id: 'writer_version', resolution: 'operator', registration: 'wave',
@@ -329,6 +358,13 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     count: d => Number(d.count ?? 0),
     impact: 'Some atoms were retired when a re-extraction returned no atoms, and the purge removes them once their hold ends',
     run: async (engine, scope) => (await import('./checks/atom-retirements.ts')).atomRetirementsRestorableCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'atom_fence_rows', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Narrowing atoms to private is a host-side, explicit-only repair.',
+    count: d => Number(d.count ?? 0),
+    impact: 'Some world atoms carry text of a fence row their source page shows only to the owner',
+    run: async (engine, scope) => (await import('./checks/atom-fence-rows.ts')).atomFenceRowsCheck(engine, scope.sourceIds),
   },
   {
     id: 'generation_retirements', resolution: 'repair', registration: 'wave',
