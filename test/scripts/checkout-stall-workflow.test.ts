@@ -16,9 +16,12 @@ const workflows = readdirSync(dir).filter(f => f.endsWith('.yml')).sort()
   .map(({ file, text }) => ({ file, parsed: load(text) as Workflow }));
 const isCheckout = (step: Step) => step.uses?.startsWith('actions/checkout@') ?? false;
 const onUbicloud = (job: Job) => JSON.stringify([job['runs-on'], job.strategy]).includes('ubicloud-');
+// FORK DELTA: this fork has no Ubicloud runners, so its full-suite workflows run on GitHub-hosted labels and the scan
+// finds none of them; the pairing check below still covers any job left on Ubicloud.
+const usesUbicloud = readFileSync(join(dir, 'test.yml'), 'utf8').includes('ubicloud-');
 
 describe('a stalled checkout is bounded and tried again', () => {
-  test('the scan finds the workflows that run the full suites', () => {
+  test.skipIf(!usesUbicloud)('the scan finds the workflows that run the full suites', () => {
     expect(workflows.map(w => w.file)).toEqual(expect.arrayContaining(['e2e.yml', 'persistence-validation.yml', 'test.yml']));
   });
 
