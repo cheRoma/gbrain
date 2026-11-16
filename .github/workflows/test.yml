@@ -745,6 +745,10 @@ jobs:
           SHARD: ${{ matrix.shard }}/4
           COVERAGE_DIR: ${{ runner.temp }}/coverage
           GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+          # FORK DELTA: GitHub-hosted runners are slower than upstream's Ubicloud ones;
+          # test/enforced-member.serial.test.ts takes ~300 s here, so the 300 s default
+          # per-file kill made it flaky.
+          GBRAIN_SERIAL_FILE_TIMEOUT: '600'
       - name: Upload receipts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
