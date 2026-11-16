@@ -201,8 +201,9 @@ async function revoke(name: string) {
     const rows = await sql`
       UPDATE access_tokens SET revoked_at = now()
       WHERE name = ${name} AND revoked_at IS NULL
-      RETURNING 1
+      RETURNING id
     `;
+    for (const row of rows) await (await import('../core/wakeshift/forget.ts')).forgetWakePrincipal(sql, { kind: 'legacy_token', id: String(row.id) });
     if (rows.length === 0) {
       console.error(`No active token found with name "${name}".`);
       process.exit(1);
@@ -233,6 +234,7 @@ async function revokeById(id: string) {
       console.error(`No active token found with id "${id}".`);
       process.exit(1);
     }
+    await (await import('../core/wakeshift/forget.ts')).forgetWakePrincipal(sql, { kind: 'legacy_token', id });
     console.log(`Token "${rows[0].name}" (${id}) revoked.`);
   });
 }
@@ -375,6 +377,7 @@ async function revokeClient(clientId: string) {
         console.error(`No client found with id "${clientId}"`);
         process.exit(1);
       }
+      await (await import('../core/wakeshift/forget.ts')).forgetWakePrincipal(sql, { kind: 'oauth_client', id: clientId });
       console.log(`OAuth client revoked: "${rows[0].client_name}" (${clientId})`);
       console.log('Tokens and authorization codes purged via cascade.');
     });
@@ -928,19 +931,18 @@ async function rescopeClientWith(engine: BrainEngine, clientId: string, parsed: 
   if (parsed.json) { console.log(JSON.stringify({ ...result, principal_grant: grantFromClient(result.after), ...(bound ? { binding: bound } : {}) }, null, 2)); return; }
   console.log(`OAuth client ${parsed.dryRun ? 'grant preview' : 'rescoped'}: ${result.after.clientName} (${clientId})`);
   console.log(`  Revision: ${result.before.revision} -> ${result.after.revision}`);
-  printClientGrantAxes(result.after);
+  printClientGrantAxes(result.after, parsed.dryRun ? result.before : undefined);
   if (bound) console.log(bindingLine(bound, parsed.dryRun));
   console.log('Restrictions apply on the next request. Added scopes require a new access token; the client secret is unchanged.');
 }
 
-function printClientGrantAxes(grant: ClientGrant) {
-  console.log(`  Scopes: ${grant.scopes.join(' ') || '<none>'}`);
-  console.log(`  Write source: ${grant.sourcesNone ? 'none (every read and write refused)' : grant.sourceId}`);
-  console.log(`  Federated reads: ${grant.federatedRead.join(', ') || '<none>'}`);
-  console.log(`  Takes holders: ${grant.takesHolders === null ? 'world (default)' : grant.takesHolders.join(', ') || 'none (every take hidden)'}`);
-  console.log(`  Private pages: ${renderPrivatePages(grant.privatePages)}`);
-  console.log(`  Tool surface: ${grant.surface ?? '<server default>'}`);
-  console.log(`  Delegated spending: ${grant.budgetUsdPerDay === null ? 'unlimited' : '$' + grant.budgetUsdPerDay + '/day'}`);
+/** A grant's axes, one line each; with `before` (a preview) a changed axis reads `before -> after`. */
+function printClientGrantAxes(grant: ClientGrant, before?: ClientGrant) {
+  const axes: Array<[string, (g: ClientGrant) => string]> = [['Scopes', g => g.scopes.join(' ') || '<none>'], ['Write source', g => g.sourcesNone ? 'none (every read and write refused)' : String(g.sourceId)],
+    ['Federated reads', g => g.federatedRead.join(', ') || '<none>'], ['Operations', g => g.allowedOperations === null ? 'all (no snapshot)' : g.allowedOperations.join(', ') || 'none'],
+    ['Slug prefixes', g => g.boundSlugPrefixes?.join(', ') || '<none>'], ['Takes holders', g => g.takesHolders === null ? 'world (default)' : g.takesHolders.join(', ') || 'none (every take hidden)'],
+    ['Private pages', g => renderPrivatePages(g.privatePages)], ['Tool surface', g => g.surface ?? '<server default>'], ['Delegated spending', g => g.budgetUsdPerDay === null ? 'unlimited' : '$' + g.budgetUsdPerDay + '/day']];
+  for (const [label, render] of axes) { const after = render(grant), was = before ? render(before) : after; console.log(`  ${label}: ${was === after ? after : `${was} -> ${after}`}`); }
 }
 
 function printTokenRescope(result: RescopeTokenResult, json: boolean, bound?: BindingResult) {

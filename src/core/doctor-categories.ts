@@ -124,6 +124,7 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'guest_source',
   'extractor_facts_expired',
   'unwithdrawn_facts',
+  'purged_page_facts',
   'loop_facts_drift',
   'ontology_facts_fenced',
   'orphan_persistence_bindings',
@@ -285,6 +286,10 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'timeline_history',
   // #6147: imported conversation pages that may still carry a typed credential (cached audit).
   'transcript_secret_exposure',
+  // GST-2768: the conversation archive keeping up with the harness sessions (doctor/checks/transcript-archive.ts).
+  'transcript_archive_freshness',
+  // GST-2731: facts pages with undated fact lines (doctor/checks/facts-pages.ts).
+  'facts_undated_lines',
   // #5254 — pages written database-only to a source with no canonical owner.
   'unbound_source',
   'undeclared_db_only_pages',
@@ -463,6 +468,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'queue_health',
   // Wakeshift PR 1: report-back key, enabled state and dead/id_reused watches (doctor/checks/wakeshift.ts).
   'wakeshift',
+  // Wakeshift PR 2: installed @wakeshift/openclaw vs the pinned version (doctor/checks/wakeshift-openclaw.ts).
+  'wakeshift_openclaw',
   // #4578: brain-wide maintenance jobs dying at their deadline.
   'global_maintenance_timeouts',
   // GBRA-130 C-6: no completed brain-wide pass while jobs fail or a phase keeps blocking it.

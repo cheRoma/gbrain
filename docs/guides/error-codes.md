@@ -342,6 +342,76 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 |---|---|---|---|---|---|---|
 | The change needs the owner's explicit approval before it can proceed. | The step needs the user's decision before it runs. | Stop and ask the user; re-run only with the authorization the message names. | user | `repeat the read that failed` | 1 | no |
 
+### archive_audience_unproven
+
+<a id="archive_audience_unproven"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The conversation archive could not check whether the brain is shared (its client-usage read failed), so it wrote nothing this run. | A brain with no audience declared counts as shared when several clients use it; without that read a page written as personal could be open to other members, so the run publishes nothing. | Rerun gbrain transcripts archive run; if it repeats, declare the audience with gbrain config set brain.audience personal\|shared. | agent | `repeat the read that failed` | 1 | yes |
+
+More: [docs/guides/conversation-archive.md#privacy](../../docs/guides/conversation-archive.md#privacy)
+
+### archive_gateway_auth
+
+<a id="archive_gateway_auth"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The OpenClaw Gateway refused the credential the conversation archive used, so no OpenClaw conversation was read this run; the archive ledger is unchanged. | The Gateway token or device pairing belongs to the user; gbrain never mints or edits one. | Ask the user to give gbrain the Gateway token (GBRAIN_OPENCLAW_GATEWAY_TOKEN, or gateway.auth in the OpenClaw config on this machine), then rerun gbrain transcripts archive run. Run: gbrain transcripts archive status --json | user | `gbrain doctor --json` | 1 | no |
+
+More: [docs/guides/conversation-archive.md#openclaw](../../docs/guides/conversation-archive.md#openclaw)
+
+### archive_gateway_failed
+
+<a id="archive_gateway_failed"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The OpenClaw Gateway answered the conversation archive with an error, so no OpenClaw conversation was read this run; the archive ledger is unchanged. | A temporary condition (a lock, a pending write, a rate limit); the same request can succeed later. | Rerun gbrain transcripts archive run; if it repeats, report the redacted message from gbrain transcripts archive status --json. Run: gbrain transcripts archive status --json | agent | `repeat the read that failed` | 1 | yes |
+
+More: [docs/guides/conversation-archive.md#openclaw](../../docs/guides/conversation-archive.md#openclaw)
+
+### archive_gateway_unreachable
+
+<a id="archive_gateway_unreachable"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The conversation archive could not reach the OpenClaw Gateway, so no OpenClaw conversation was read this run; the archive ledger is unchanged, so the next run retries safely. | Current OpenClaw keeps live sessions in SQLite owned by its Gateway, and gbrain reads them only through the Gateway's documented RPCs (openclaw gateway call), never the file. | Start the Gateway (openclaw gateway) or point gbrain at it with GBRAIN_OPENCLAW_GATEWAY_URL, then rerun gbrain transcripts archive run. Run: gbrain transcripts archive status --json | agent | `repeat the read that failed` | 1 | yes |
+
+More: [docs/guides/conversation-archive.md#openclaw](../../docs/guides/conversation-archive.md#openclaw)
+
+### archive_owner_unset
+
+<a id="archive_owner_unset"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| On a shared brain the conversation archive held every day and wrote nothing, because no owner member is named and an archive page without readable_by would be open to the whole source. | Only the operator of the brain host can change what blocks this. | Ask the user which enabled member owns the brain, run gbrain access owner set <member>, then rerun the archive; held days are written then. Run: gbrain access owner | user | `gbrain doctor --json` | 1 | no |
+
+More: [docs/guides/conversation-archive.md#privacy](../../docs/guides/conversation-archive.md#privacy)
+
+### archive_redaction_failed
+
+<a id="archive_redaction_failed"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Redaction failed for a conversation, so the conversation archive held its days instead of writing them; the next run retries them. | Archive pages are written only after redaction succeeded over the whole session; a day is never written unredacted and never dropped. | Rerun gbrain transcripts archive run; if the day stays held, check the user redaction pattern file named in the held message. Run: gbrain transcripts archive status --json | agent | `repeat the read that failed` | 1 | yes |
+
+More: [docs/guides/conversation-archive.md#privacy](../../docs/guides/conversation-archive.md#privacy)
+
+### archive_run_busy
+
+<a id="archive_run_busy"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Another conversation archive run holds this source, so this run read and wrote nothing. | A run decides each day from the archive ledger it read when it started, so two runs at once could publish older history over newer; runs on one source take turns on a database lease. | Wait for the other run to finish, then rerun gbrain transcripts archive run. Run: gbrain status --section locks --json | agent | `repeat the read that failed` | 1 | yes |
+
+More: [docs/guides/conversation-archive.md#openclaw](../../docs/guides/conversation-archive.md#openclaw)
+
 ### atom_drain_incomplete
 
 <a id="atom_drain_incomplete"></a>
@@ -3542,6 +3612,16 @@ More: [docs/guides/write-refusals.md#on_behalf_of_not_permitted](../../docs/guid
 
 More: [docs/guides/write-refusals.md#on_behalf_of_unknown_member](../../docs/guides/write-refusals.md#on_behalf_of_unknown_member)
 
+### openclaw_not_found
+
+<a id="openclaw_not_found"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| gbrain setup openclaw --wakeshift found no openclaw on PATH, so Wakeshift's OpenClaw plugin was not installed; nothing changed. | The plugin installs through OpenClaw's own installer where the gateway runs, so setup never writes OpenClaw's plugin directory itself. | Run gbrain setup openclaw --wakeshift where the OpenClaw gateway runs (in its container, if it is in one). | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/mcp/OPENCLAW.md#have-gbrain-report-back-to-this-chat](../../docs/mcp/OPENCLAW.md#have-gbrain-report-back-to-this-chat)
+
 ### origin_twin_mass_merge_refused
 
 <a id="origin_twin_mass_merge_refused"></a>
@@ -4481,6 +4561,16 @@ Reasons: `rename_source_changed`.
 | A `gbrain repair failed-writes` preview read ran past the database statement timeout, so the preview stopped; nothing was saved, no approval checkpoint was written and no page changed. | The preview classes every refused caller write against the write journal (replay attempts, later requests of the same page, recovered fact requests) in a few set reads. They use the `persistence_requests_replay_id` and `persistence_requests_slug_sequence` indexes; when either is missing or INVALID, or the journal is large enough that a set read outlasts the timeout, the server ends the read. | Build the request indexes with gbrain repair request-indexes --apply, then run the same preview again; if it stops again with the indexes valid, run it once with a longer statement timeout on the brain host. Run: gbrain repair request-indexes --json | agent | `repeat the read that failed` | 1 | no |
 
 More: [docs/guides/troubleshooting.md#repair-preview-timeout](../../docs/guides/troubleshooting.md#repair-preview-timeout)
+
+### repair_propose_dir_in_git
+
+<a id="repair_propose_dir_in_git"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| gbrain repair visibility --propose was pointed at a directory inside a git work tree for its slugs files, so nothing was written. | The slugs files list page slugs and who would read them; a file inside a checkout can be committed and pushed. | Pass --out <dir> outside any git checkout, or leave --out off to use the gbrain config directory (with GBRAIN_HOME outside any checkout). | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/repair.md#propose-readers](../../docs/guides/repair.md#propose-readers)
 
 ### request_already_submitted
 
@@ -5562,9 +5652,9 @@ More: [docs/guides/write-refusals.md#storage-manifest-refusals](../../docs/guide
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| A storage card failed validation (a missing or malformed field, a command field, or a field gbrain stamps itself); nothing was written. | Every card must say where the item is, how big it is and how to restore it, and carries no commands, so a card is complete and safe to act on when it is found months later. | Fix the field the message names and send the card again; gbrain storage-register --help lists the card fields. For an adopt blocked on access_pending or access_unpreservable, settle the access rules over the interim page (gbrain access status) or give it readers its folder rules also list, then preview again. | agent | `repeat the read that failed` | 1 | no |
+| A storage card failed validation (a missing or malformed field, a command field, or a field gbrain stamps itself); nothing was written. | Every card must say where the item is, how big it is and how to restore it, and carries no commands, so a card is complete and safe to act on when it is found months later. | Fix the field the message names and send the card again; gbrain storage-register --help lists the card fields. For an adopt blocked on access_pending or access_unpreservable, settle the access rules over the interim page (gbrain access status) or give it readers its folder rules also list, then preview again. For truncated, move the ## Record section to the top of the interim page. | agent | `repeat the read that failed` | 1 | no |
 
-Reasons: `schema`, `command_field`, `stamped_field`, `not_json`, `not_object`, `too_large`, `id_change`, `no_record`, `duplicate_id`, `access_unpreservable`, `access_pending`, `labels`, `remote_written`.
+Reasons: `schema`, `command_field`, `stamped_field`, `not_json`, `not_object`, `too_large`, `id_change`, `no_record`, `truncated`, `duplicate_id`, `access_unpreservable`, `access_pending`, `labels`, `remote_written`.
 
 More: [docs/guides/write-refusals.md#storage-manifest-refusals](../../docs/guides/write-refusals.md#storage-manifest-refusals)
 
@@ -6190,7 +6280,7 @@ More: [docs/guides/wakeshift.md#the-key](../../docs/guides/wakeshift.md#the-key)
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| watch_job wakes an MCP conversation, and a local CLI run has none to wake. | The request itself was wrong or no longer matches the brain; nothing was changed. | Run gbrain jobs wait <id> to block until the job finishes. | agent | `repeat the read that failed` | 1 | no |
+| A watch tool (watch_job, watch_write_request, watch_cron) wakes an MCP conversation, and a local CLI run has none to wake. | The request itself was wrong or no longer matches the brain; nothing was changed. | Run gbrain jobs wait <id> for a job, or gbrain write-request -- <request_id> for a write. | agent | `repeat the read that failed` | 1 | no |
 
 More: [docs/guides/wakeshift.md#delivery-and-latency](../../docs/guides/wakeshift.md#delivery-and-latency)
 
@@ -6220,9 +6310,9 @@ More: [docs/guides/wakeshift.md#troubleshooting](../../docs/guides/wakeshift.md#
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| Reporting back refused (gbrain wakeshift enable, or watch_job after a member was added): this brain has live access members, and this release reports back only on brains that serve their owner alone. | Every member of the brain owner's Wakeshift organization can read the wakes it sends, and Wakeshift's terms make the operator pass its Connector Terms to each member. Shared brains get a terms step in a later release; until then reporting back stays off there. | Leave reporting back off on this brain; agents can use wait_job or gbrain jobs wait <id>. | user | `gbrain doctor --json` | 1 | no |
+| Reporting back refused (gbrain wakeshift enable, or a watch tool): this brain has live access members and its operator has not set the terms and privacy links Wakeshift requires. | Wakeshift's terms (6.2, 6.6) make the operator show each person its own terms and privacy policy, which refer them to Wakeshift's Connector Terms and Privacy Policy, before the first wake. gbrain shows that step from the two links the owner sets on the brain host. | Ask the brain owner to run gbrain wakeshift enable --terms-url <https url> --privacy-url <https url>; meanwhile agents can use wait_job or get_write_request. | user | `gbrain doctor --json` | 1 | no |
 
-More: [docs/guides/wakeshift.md#who-it-is-for](../../docs/guides/wakeshift.md#who-it-is-for)
+More: [docs/guides/wakeshift.md#shared-brains](../../docs/guides/wakeshift.md#shared-brains)
 
 ### wakeshift_unavailable
 
